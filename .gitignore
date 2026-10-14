@@ -1,0 +1,4 @@
+.claude-plugin/types/
+.claude/settings.local.json
+node_modules/
+web/custom.css

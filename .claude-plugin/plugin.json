@@ -1,0 +1,59 @@
+{
+  "name": "plan-crutches",
+  "version": "0.2.0",
+  "description": "Visual review of Claude's plan before it runs: a browser page with the change tree, signatures, comments, a diagram editor and Q&A.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Language of the review pane (en or uk)",
+      "default": "en",
+      "options": [
+        "en",
+        "uk"
+      ]
+    },
+    "model": {
+      "type": "string",
+      "title": "Model",
+      "description": "Model alias used to generate method bodies and to extract plan structure when the plan has no plan-crutches block",
+      "default": "sonnet"
+    },
+    "plansDir": {
+      "type": "string",
+      "title": "Plans folder",
+      "description": "Folder, relative to the project, where each reviewed plan is recorded as a Markdown file",
+      "default": "docs/plans"
+    },
+    "summaryLimit": {
+      "type": "number",
+      "title": "Summary limit",
+      "description": "Characters of the plan summary shown before the Show all button",
+      "default": 9000
+    },
+    "port": {
+      "type": "number",
+      "title": "Page port",
+      "description": "Port of the review page server on 127.0.0.1. 0 picks a free port each time; a taken port falls back to a free one.",
+      "default": 4817
+    },
+    "openIn": {
+      "type": "string",
+      "title": "Open the page in",
+      "description": "auto: the Claude desktop browser pane when available, else the system browser. system: the system browser. none: only show the link.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "system",
+        "none"
+      ]
+    },
+    "nodePath": {
+      "type": "string",
+      "title": "Node binary",
+      "description": "Path of the node executable that runs the page server. Empty means node from PATH, then the usual install locations.",
+      "default": ""
+    }
+  }
+}

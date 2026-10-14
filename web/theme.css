@@ -1,0 +1,138 @@
+/* Plan Crutches theme. Change the colors here, or put overrides in web/custom.css
+   (that file is yours; the server serves it when it exists and ignores it otherwise). */
+
+:root {
+  --font: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --radius: 10px;
+  --radius-sm: 6px;
+
+  --bg: #f6f7fb;
+  --bg-elev: #ffffff;
+  --bg-code: #f1f3f9;
+  --bg-hover: #eef1ff;
+  --fg: #1c2030;
+  --fg-dim: #6b7085;
+  --border: #e1e4ee;
+  --shadow: 0 10px 30px rgba(20, 24, 50, 0.12);
+
+  --accent: #5b6cff;
+  --accent-fg: #ffffff;
+  --accent-soft: #e8ebff;
+
+  --new: #1f9d55;
+  --new-soft: #e3f6ea;
+  --mod: #d9850b;
+  --mod-soft: #fff1dc;
+  --del: #d64545;
+  --del-soft: #fde6e6;
+  --mixed: #6b7085;
+  --mixed-soft: #eceef4;
+
+  --diff-add-bg: #e6f7ec;
+  --diff-add-fg: #166b3a;
+  --diff-del-bg: #fdecec;
+  --diff-del-fg: #9b2c2c;
+  --diff-hunk-bg: #eef1ff;
+  --diff-hunk-fg: #4650b8;
+
+  --sel: rgba(91, 108, 255, 0.22);
+  --comment: #7c3aed;
+  --comment-soft: #f1e9ff;
+
+  --syn-kw: #7c3aed;
+  --syn-str: #0f766e;
+  --syn-num: #b45309;
+  --syn-cm: #8a8fa3;
+  --syn-type: #1d4ed8;
+  --syn-fn: #0369a1;
+  --syn-punct: #6b7085;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12141c;
+    --bg-elev: #1a1d28;
+    --bg-code: #151823;
+    --bg-hover: #222638;
+    --fg: #e6e8f0;
+    --fg-dim: #9299b0;
+    --border: #2a2f40;
+    --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+
+    --accent: #7b8aff;
+    --accent-fg: #0d1020;
+    --accent-soft: #262b4a;
+
+    --new: #3ccf7a;
+    --new-soft: #173126;
+    --mod: #f0a63a;
+    --mod-soft: #3a2b14;
+    --del: #ff6b6b;
+    --del-soft: #3d1c1c;
+    --mixed: #9299b0;
+    --mixed-soft: #262a3a;
+
+    --diff-add-bg: #15301f;
+    --diff-add-fg: #8ee5b0;
+    --diff-del-bg: #3a1b1b;
+    --diff-del-fg: #ffb3b3;
+    --diff-hunk-bg: #232848;
+    --diff-hunk-fg: #b4bcff;
+
+    --sel: rgba(123, 138, 255, 0.3);
+    --comment: #c4a6ff;
+    --comment-soft: #2b2340;
+
+    --syn-kw: #c4a6ff;
+    --syn-str: #7dd3c0;
+    --syn-num: #f5b971;
+    --syn-cm: #767c92;
+    --syn-type: #8ab4ff;
+    --syn-fn: #7cc7ff;
+    --syn-punct: #9299b0;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #12141c;
+  --bg-elev: #1a1d28;
+  --bg-code: #151823;
+  --bg-hover: #222638;
+  --fg: #e6e8f0;
+  --fg-dim: #9299b0;
+  --border: #2a2f40;
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+
+  --accent: #7b8aff;
+  --accent-fg: #0d1020;
+  --accent-soft: #262b4a;
+
+  --new: #3ccf7a;
+  --new-soft: #173126;
+  --mod: #f0a63a;
+  --mod-soft: #3a2b14;
+  --del: #ff6b6b;
+  --del-soft: #3d1c1c;
+  --mixed: #9299b0;
+  --mixed-soft: #262a3a;
+
+  --diff-add-bg: #15301f;
+  --diff-add-fg: #8ee5b0;
+  --diff-del-bg: #3a1b1b;
+  --diff-del-fg: #ffb3b3;
+  --diff-hunk-bg: #232848;
+  --diff-hunk-fg: #b4bcff;
+
+  --sel: rgba(123, 138, 255, 0.3);
+  --comment: #c4a6ff;
+  --comment-soft: #2b2340;
+
+  --syn-kw: #c4a6ff;
+  --syn-str: #7dd3c0;
+  --syn-num: #f5b971;
+  --syn-cm: #767c92;
+  --syn-type: #8ab4ff;
+  --syn-fn: #7cc7ff;
+  --syn-punct: #9299b0;
+}
