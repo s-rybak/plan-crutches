@@ -13,29 +13,29 @@ Plan Crutches is a mod for Claude Code. It shows Claude's plan in a review page 
 
 ## The review page
 
-The page is plain HTML, CSS and JavaScript under `web/`, served by a small Node server under `server/` on `127.0.0.1`. The mod starts the server with `$.process.spawn`, pushes the review state to it after every change, and reads every action of the page from the server's standard output. The page gets the state over Server-Sent Events, so it follows the session live.
+The page is plain HTML, CSS and JavaScript under `web/`, served by a small Node server under `server/` on `127.0.0.1`. The mod starts the server with `$.process.spawn`. After every change, the mod pushes the review state to the server. The mod reads every action of the page from the server's standard output. The page gets the state over Server-Sent Events, so it follows the session live.
 
-- Header: plan title, version, status, comment count, connection dot, theme toggle, language toggle (EN and UA) and the Submit button.
+- Header: plan title, version, status, comment count, connection dot, theme toggle, language toggle (EN and UA) and the Submit button. The header and the tabs float: they stay at the top while you scroll.
 - Task: the raw task text, from the Jira issue Claude fetched or from your prompt.
 - Summary: the plan summary as Markdown with images, cut at 9000 characters with a Show all button.
 - Changes by folder: every folder and file the plan touches, marked `new`, `mod` or `del`, with the number of comments on each. Click a folder to fold it, click the speech bubble to comment on it, click a file to open it.
-- File view: the description of the change, each symbol with its highlighted signature, a diff of the signatures against the current file, the full file on demand, and an Expand implementation button that asks the model for a body. In the diff and in the preview of a new file, every planned signature carries a Show implementation button: the generated code takes the place of the stub right there, and you can comment on its lines.
-- Select any text with the mouse, in a code block, the summary, the task or an answer: a popup opens next to the selection. Type the comment and press Enter. A code comment keeps the line range and the selected text, and the lines stay marked.
+- File view: the description of the change and each symbol with its highlighted signature. Below them, a diff of the signatures against the current file and the full file on demand. An Expand implementation button asks the model for a body. In the diff and in the preview of a new file, every planned signature carries a Show implementation button. The generated code takes the place of the stub right there, and you can comment on its lines.
+- Select any text with the mouse, in a code block, the summary, the task or an answer: a popup opens next to the selection with two tabs. Comment: type the comment and press Enter. A code comment keeps the line range and the selected text, and the lines stay marked. Ask: type a question about the selected text and press Enter. Claude answers in the same window, with the selection and its place as context, and you continue the conversation there. The thread is kept in the Ask tab, and "Add the conversation to a comment" turns it into a comment on the same lines.
 - Diagram: boxes, arrows, free strokes and text labels on an SVG canvas. The drawing is saved with the review, described to Claude on Submit, and Save as SVG writes it next to the Markdown record.
-- Ask: a question box that answers from the plan and the session without changing either. An answer can become a comment.
+- Ask: a question box that answers from the plan and the session without changing either. Every question is a thread: Reply continues the conversation under it, with the earlier turns as context. A thread shows where it came from and the selected text, and can become a comment. Answered threads go into the Markdown record.
 - Comments: every comment by state (pending, sent, resolved) and the review history.
 
 The pane in Claude Code stays as a second view with the page link, so a terminal session still has a review surface.
 
 ## Colors and styles
 
-The page reads its colors from CSS variables in `web/theme.css`, with light and dark values. Change them there, or put overrides in `web/custom.css`. That file is yours and is not part of the mod: the server serves it when it exists and the page ignores a missing one. The theme toggle in the header switches between auto, light and dark.
+The page reads its colors from CSS variables in `web/theme.css`, with light and dark values. Change them there, or put overrides in `web/custom.css`. That file is yours and is not part of the mod. If the file exists, the server serves it. If the file is missing, the page ignores it. The theme toggle in the header switches between auto, light and dark.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `/plan-review` | Starts the page server if needed, opens the page and the pane. |
+| `/plan-review` | If the page server is not running, starts it. Opens the page and the pane. |
 | `/plan-review demo` | Loads a demo plan so you can try the page without plan mode. |
 | `/plan-review url` | Prints the page address with its token. |
 | `/plan-review close` | Closes the pane. The page keeps running. |
@@ -49,16 +49,26 @@ Set them in `/config` or in `settings.json` under `pluginConfigs.plan-crutches.o
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `language` | `en` | Page and pane language, `en` or `uk`. |
-| `model` | `sonnet` | Model for method bodies and for plan extraction when the block is missing. |
+| `model` | `sonnet` | Model for the light calls: plan structure extraction, the pick of project files for an implementation, and answers without a session fork. |
+| `bodyModel` | `opus` | Model that writes method bodies. Empty means the `model` option. |
 | `plansDir` | `docs/plans` | Folder, relative to the project, for the Markdown records and SVG files. |
 | `summaryLimit` | `9000` | Characters of the summary shown before Show all. |
 | `port` | `4817` | Port of the page server on 127.0.0.1. A taken port falls back to a free one. |
 | `openIn` | `auto` | Where the page opens: `auto` tries the Claude desktop browser pane, then the system browser. `system` uses the system browser. `none` only shows the link. |
 | `nodePath` | empty | Path of the node executable. Empty means node from PATH, then the usual install locations. Node 18 or newer. |
 
+## How an implementation is generated
+
+Expand implementation and Show implementation ask `bodyModel` for one symbol's body. The prompt carries, in this order:
+
+1. The whole plan: the summary and every planned file with every symbol's full signature and description. This block is the same for every symbol of a plan version and is marked for the prompt cache.
+2. The implementations already generated for the other symbols, the current file's own first, so names, signatures and behavior stay consistent across the plan.
+3. Real project files. These are the other planned files as they are on disk and the files the current file imports. The `model` option also picks up to 8 files from the project's file list (`git ls-files`): the types, helpers and callers the symbol needs.
+4. The current content of the file and the symbol to implement.
+
 ## Security of the page
 
-The server binds to `127.0.0.1` only and answers only requests whose `Host` header names the local machine, so a web site that points its name at `127.0.0.1` gets a 403. Every API call carries a token that the mod makes once per session. The page gets the token from the link, keeps it in local storage and then removes it from the address bar. Project files are served under `/project/` with the same token, for images in the summary and for the Full file view, and never outside the project folder. The state the mod pushes holds the plan and the signature diffs, not the text of the project files.
+The server binds to `127.0.0.1` only. It answers only requests whose `Host` header names the local machine. A web site that points its name at `127.0.0.1` gets a 403. Every API call carries a token that the mod makes once per session. The page gets the token from the link, keeps it in local storage and then removes it from the address bar. Project files are served under `/project/` with the same token, for images in the summary and for the Full file view. The server never serves a file outside the project folder. The state the mod pushes holds the plan and the signature diffs, not the text of the project files.
 
 ## Run it from this folder
 

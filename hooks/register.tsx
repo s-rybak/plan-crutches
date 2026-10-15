@@ -29,15 +29,22 @@ import type { SelectableProps } from './select'
 import {
   BODY_SYSTEM,
   EXTRACTION_SYSTEM,
+  PICK_FILES_SYSTEM,
   PLAN_BLOCK_INSTRUCTIONS,
   PLAN_BLOCK_REMINDER,
   approvePrompt,
+  askMorePrompt,
   askPrompt,
   bodyPrompt,
   denyMessage,
   extractionPrompt,
+  importCandidates,
+  parseFileList,
+  pickFilesPrompt,
+  relativeImports,
   revisionPrompt,
 } from './prompts'
+import type { RelatedFile } from './prompts'
 import { t } from './i18n'
 import { recordFileName, renderRecord } from './record'
 import { PANE_ID, bodyKey, newId } from './state'
@@ -45,7 +52,16 @@ import { buildSnapshot, openCommands, pageUrl, parseAction, parseServerLine, par
 import type { WebAction } from './web'
 
 type OpenIn = 'auto' | 'system' | 'none'
-type Options = { language: Lang; model: string; plansDir: string; summaryLimit: number; port: number; openIn: OpenIn; nodePath: string }
+type Options = {
+  language: Lang
+  model: string
+  bodyModel: string
+  plansDir: string
+  summaryLimit: number
+  port: number
+  openIn: OpenIn
+  nodePath: string
+}
 
 const planAtom = atom<'plan-crutches', 'plan'>(
   { plugin: 'plan-crutches', key: 'plan' } as const,
@@ -124,13 +140,14 @@ const SERVER_IDLE_MS = 600_000
 function readOptions(raw: PluginOptions): Options {
   const language = raw.language === 'uk' ? 'uk' : 'en'
   const model = typeof raw.model === 'string' && raw.model.trim() ? raw.model.trim() : 'sonnet'
+  const bodyModel = typeof raw.bodyModel === 'string' && raw.bodyModel.trim() ? raw.bodyModel.trim() : 'opus'
   const plansDir =
     typeof raw.plansDir === 'string' && raw.plansDir.trim() ? raw.plansDir.trim().replace(/^\/+|\/+$/g, '') : 'docs/plans'
   const summaryLimit = typeof raw.summaryLimit === 'number' && raw.summaryLimit > 200 ? Math.floor(raw.summaryLimit) : 9000
   const port = typeof raw.port === 'number' && raw.port >= 0 && raw.port <= 65535 ? Math.floor(raw.port) : 4817
   const openIn: OpenIn = raw.openIn === 'system' || raw.openIn === 'none' ? raw.openIn : 'auto'
   const nodePath = typeof raw.nodePath === 'string' ? raw.nodePath.trim() : ''
-  return { language, model, plansDir, summaryLimit, port, openIn, nodePath }
+  return { language, model, bodyModel, plansDir, summaryLimit, port, openIn, nodePath }
 }
 
 const EMPTY_REVIEW: Review = { status: 'idle', version: 0, parsedFrom: 'none', warnings: [], history: [], previousPaths: [] }
@@ -139,7 +156,7 @@ function freshUi(previous: UiState): UiState {
   return { lang: previous.lang, tab: 'changes', view: 'tree', collapsed: [], showFullSummary: false, showTask: true, expanded: [] }
 }
 
-let options: Options = { language: 'en', model: 'sonnet', plansDir: 'docs/plans', summaryLimit: 9000, port: 4817, openIn: 'auto', nodePath: '' }
+let options: Options = { language: 'en', model: 'sonnet', bodyModel: 'opus', plansDir: 'docs/plans', summaryLimit: 9000, port: 4817, openIn: 'auto', nodePath: '' }
 
 // ---- the review page server -------------------------------------------------
 
@@ -475,15 +492,16 @@ function applyTask(plan: PlanModel, task: TaskCapture): void {
 }
 
 async function writeRecord($: EngineInterface): Promise<void> {
-  const [plan, review, comments, canvas] = await Promise.all([
+  const [plan, review, comments, canvas, qa] = await Promise.all([
     read($, planAtom),
     read($, reviewAtom),
     read($, commentsAtom),
     read($, canvasAtom),
+    read($, qaAtom),
   ])
   if (!plan || review.isDemo || !review.recordPath) return
   try {
-    const text = renderRecord({ plan, review, comments, canvas, nowMs: await $.clock.now() })
+    const text = renderRecord({ plan, review, comments, canvas, qa, nowMs: await $.clock.now() })
     await $.fs.write(review.recordPath, text)
   } catch (error) {
     $.ui.log(`plan-crutches: could not write ${review.recordPath}: ${String(error)}`, { to: 'debug' })
@@ -638,10 +656,9 @@ async function submit($: EngineInterface): Promise<void> {
 async function loadFile($: EngineInterface, path: string): Promise<void> {
   const files = await read($, filesAtom)
   if (files[path] !== undefined) return
-  const review = await read($, reviewAtom)
   let content: string | null = null
   try {
-    const base = review.isDemo ? `${$.plugin.root}/fixtures/demo-src` : await $.session.cwd()
+    const base = await projectBase($)
     const full = `${base}/${path}`
     if (await $.fs.exists(full)) content = await $.fs.read(full)
   } catch {
@@ -649,6 +666,92 @@ async function loadFile($: EngineInterface, path: string): Promise<void> {
   }
   await update($, filesAtom, current => ({ ...current, [path]: content }))
   changed($)
+}
+
+/** The project folder the plan's paths are relative to (the demo has its own). */
+async function projectBase($: EngineInterface): Promise<string> {
+  const review = await read($, reviewAtom)
+  return review.isDemo ? `${$.plugin.root}/fixtures/demo-src` : await $.session.cwd()
+}
+
+/** Reads one project file for a prompt; null when it is missing or unreadable. */
+async function readProjectFile($: EngineInterface, base: string, path: string): Promise<string | null> {
+  if (path.includes('..')) return null
+  try {
+    const full = `${base}/${path}`
+    if (!(await $.fs.exists(full))) return null
+    return await $.fs.read(full)
+  } catch {
+    return null
+  }
+}
+
+const MAX_LISTED_FILES = 4000
+const SKIP_LISTED = /(^|\/)(node_modules|dist|build|vendor|\.git|coverage|target|__pycache__)(\/|$)|\.(png|jpe?g|gif|webp|ico|svg|woff2?|ttf|lock|map|min\.js)$/i
+
+/** The project's tracked files from git, else nothing; the model picks from this list. */
+async function listProjectFiles($: EngineInterface, base: string): Promise<string[]> {
+  try {
+    const ran = await $.process.run(['git', 'ls-files', '--cached', '--others', '--exclude-standard'], { cwd: base, timeoutMs: 20_000 })
+    if (ran.exitCode !== 0) return []
+    return ran.stdout
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line && !SKIP_LISTED.test(line))
+      .slice(0, MAX_LISTED_FILES)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * The real code the implementation needs: the other planned files as they are
+ * on disk, what the current file imports, and the files a cheap model picks
+ * from the project's file list.
+ */
+async function gatherRelatedFiles($: EngineInterface, plan: PlanModel, file: PlanFile, symbol: PlanSymbol, fileText: string | null): Promise<RelatedFile[]> {
+  const base = await projectBase($)
+  const related: RelatedFile[] = []
+  const seen = new Set<string>([file.path])
+  const add = async (path: string, why: string): Promise<void> => {
+    if (seen.has(path) || related.length >= 24) return
+    seen.add(path)
+    const text = await readProjectFile($, base, path)
+    if (text !== null && text.trim()) related.push({ path, text, why })
+  }
+  for (const other of plan.files) {
+    if (other.path !== file.path && other.status !== 'new') await add(other.path, `planned ${other.status}`)
+  }
+  const sources = [fileText ?? '', symbol.signature, ...file.symbols.map(one => one.signature)]
+  for (const spec of relativeImports(sources.join('\n'))) {
+    for (const candidate of importCandidates(file.path, spec)) {
+      if (seen.has(candidate)) break
+      if (await $.fs.exists(`${base}/${candidate}`).catch(() => false)) {
+        await add(candidate, `imported by ${file.path}`)
+        break
+      }
+    }
+  }
+  const listed = await listProjectFiles($, base)
+  if (listed.length === 0) return related
+  try {
+    const picked = await $.model.complete({
+      model: options.model,
+      system: PICK_FILES_SYSTEM,
+      prompt: pickFilesPrompt(plan, file, symbol, fileText, listed, [...seen]),
+      maxTokens: 400,
+      effort: 'low',
+      timeoutMs: 60_000,
+    })
+    if (picked.isAnswered) {
+      for (const path of parseFileList(picked.text, new Set(listed))) await add(path, 'chosen as context')
+    } else {
+      $.ui.log(`plan-crutches: file pick for ${symbol.name} failed: ${picked.reason}`, { to: 'debug' })
+    }
+  } catch (error) {
+    $.ui.log(`plan-crutches: file pick for ${symbol.name} failed: ${String(error)}`, { to: 'debug' })
+  }
+  return related
 }
 
 async function generateBody($: EngineInterface, file: PlanFile, symbol: PlanSymbol): Promise<void> {
@@ -662,12 +765,14 @@ async function generateBody($: EngineInterface, file: PlanFile, symbol: PlanSymb
     await loadFile($, file.path)
     fileText = (await read($, filesAtom))[file.path] ?? null
   }
+  const related = await gatherRelatedFiles($, plan, file, symbol, fileText)
+  const bodies = await read($, bodiesAtom)
   const reply = await $.model.complete({
-    model: options.model,
+    model: options.bodyModel || options.model,
     system: BODY_SYSTEM,
-    prompt: bodyPrompt(plan, file, symbol, fileText),
-    maxTokens: 3000,
-    timeoutMs: 120_000,
+    prompt: bodyPrompt({ plan, file, symbol, fileText, bodies, related }),
+    maxTokens: 6000,
+    timeoutMs: 300_000,
   })
   if (reply.isAnswered) {
     await update($, bodiesAtom, current => ({ ...current, [key]: { status: 'ready' as const, code: codeFromReply(reply.text) } }))
@@ -678,32 +783,43 @@ async function generateBody($: EngineInterface, file: PlanFile, symbol: PlanSymb
   changed($)
 }
 
-async function ask($: EngineInterface, question: string, focus?: string): Promise<void> {
+/** One answer from the session's fork, else from the plan text alone. */
+async function answerQuestion($: EngineInterface, plan: PlanModel, prompt: string): Promise<{ answer?: string; failure?: string }> {
+  const forked = await $.model.fork({ prompt })
+  if (forked.isAnswered) return { answer: forked.text }
+  if (forked.reason !== 'nothing-to-fork') return { failure: forked.reason }
+  const direct = await $.model.complete({
+    model: options.model,
+    system: 'You answer questions about an implementation plan from the plan text alone. Be brief; answer in the language of the question.',
+    prompt: `Plan "${plan.title}":\n${plan.summary.slice(0, 8000)}\n\nFiles:\n${plan.files
+      .map(file => `- [${file.status}] ${file.path}: ${file.description}`)
+      .join('\n')}\n\n${prompt}`,
+    maxTokens: 1500,
+    timeoutMs: 90_000,
+  })
+  return direct.isAnswered ? { answer: direct.text } : { failure: direct.reason }
+}
+
+async function ask($: EngineInterface, question: string, focus?: string, target?: CommentTarget, wantedId?: string): Promise<void> {
   const plan = await read($, planAtom)
   if (!plan) return
-  const id = newId()
-  await update($, qaAtom, list => [...list, { id, question, status: 'asking' as const, ...(focus ? { focus } : {}) }])
+  const review = await read($, reviewAtom)
+  const taken = new Set((await read($, qaAtom)).map(item => item.id))
+  // The page may name the thread's id, so its popup can follow the thread it opened.
+  const id = wantedId && !taken.has(wantedId) ? wantedId : newId()
+  await update($, qaAtom, list => [
+    ...list,
+    {
+      id,
+      question,
+      status: 'asking' as const,
+      createdInVersion: review.version,
+      ...(focus ? { focus } : {}),
+      ...(target ? { target } : {}),
+    },
+  ])
   changed($)
-  let answer: string | undefined
-  let failure: string | undefined
-  const forked = await $.model.fork({ prompt: askPrompt(plan, question, focus) })
-  if (forked.isAnswered) {
-    answer = forked.text
-  } else if (forked.reason === 'nothing-to-fork') {
-    const direct = await $.model.complete({
-      model: options.model,
-      system: 'You answer questions about an implementation plan from the plan text alone. Be brief; answer in the language of the question.',
-      prompt: `Plan "${plan.title}":\n${plan.summary.slice(0, 8000)}\n\nFiles:\n${plan.files
-        .map(file => `- [${file.status}] ${file.path}: ${file.description}`)
-        .join('\n')}\n\n${askPrompt(plan, question, focus)}`,
-      maxTokens: 1500,
-      timeoutMs: 90_000,
-    })
-    if (direct.isAnswered) answer = direct.text
-    else failure = direct.reason
-  } else {
-    failure = forked.reason
-  }
+  const { answer, failure } = await answerQuestion($, plan, askPrompt(plan, question, focus, target))
   await update($, qaAtom, list =>
     list.map(item =>
       item.id === id
@@ -713,6 +829,37 @@ async function ask($: EngineInterface, question: string, focus?: string): Promis
         : item,
     ),
   )
+  await writeRecord($)
+  changed($)
+}
+
+async function askMore($: EngineInterface, id: string, question: string): Promise<void> {
+  const plan = await read($, planAtom)
+  const item = (await read($, qaAtom)).find(one => one.id === id)
+  if (!plan || !item) return
+  const followupId = newId()
+  await update($, qaAtom, list =>
+    list.map(one => (one.id === id ? { ...one, followups: [...(one.followups ?? []), { id: followupId, question, status: 'asking' as const }] } : one)),
+  )
+  changed($)
+  const { answer, failure } = await answerQuestion($, plan, askMorePrompt(plan, item, question))
+  await update($, qaAtom, list =>
+    list.map(one =>
+      one.id === id
+        ? {
+            ...one,
+            followups: (one.followups ?? []).map(turn =>
+              turn.id === followupId
+                ? answer !== undefined
+                  ? { ...turn, status: 'done' as const, answer }
+                  : { ...turn, status: 'failed' as const, answer: failure ?? 'unknown' }
+                : turn,
+            ),
+          }
+        : one,
+    ),
+  )
+  await writeRecord($)
   changed($)
 }
 
@@ -809,7 +956,9 @@ async function handleAction($: EngineInterface, action: WebAction): Promise<void
       return
     }
     case 'ask':
-      return ask($, action.question, action.focus)
+      return ask($, action.question, action.focus, action.target, action.id)
+    case 'askMore':
+      return askMore($, action.id, action.question)
     case 'canvas':
       return setCanvas($, action.canvas)
     case 'canvasSvg':

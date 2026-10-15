@@ -26,7 +26,8 @@ export type WebAction =
   | { type: 'submit' }
   | { type: 'loadFile'; path: string }
   | { type: 'generateBody'; path: string; symbol: string }
-  | { type: 'ask'; question: string; focus?: string }
+  | { type: 'ask'; id?: string; question: string; focus?: string; target?: CommentTarget }
+  | { type: 'askMore'; id: string; question: string }
   | { type: 'canvas'; canvas: Canvas }
   | { type: 'canvasSvg'; svg: string }
   | { type: 'setLang'; lang: Lang }
@@ -141,7 +142,16 @@ export function parseAction(raw: unknown): WebAction | null {
       const question = str(raw.question)?.trim()
       if (!question) return null
       const focus = str(raw.focus, 2000)
-      return focus ? { type: 'ask', question, focus } : { type: 'ask', question }
+      const target = raw.target === undefined ? undefined : parseTarget(raw.target)
+      const hasTarget = target !== undefined && Object.keys(target).length > 0
+      const id = str(raw.id, 64)
+      const validId = id && /^[A-Za-z0-9_-]+$/.test(id) ? id : undefined
+      return { type: 'ask', question, ...(validId ? { id: validId } : {}), ...(focus ? { focus } : {}), ...(hasTarget ? { target } : {}) }
+    }
+    case 'askMore': {
+      const id = str(raw.id, 64)
+      const question = str(raw.question)?.trim()
+      return id && question ? { type: 'askMore', id, question } : null
     }
     case 'canvas': {
       const canvas = parseCanvas(raw.canvas)

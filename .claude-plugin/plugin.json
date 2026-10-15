@@ -17,8 +17,14 @@
     "model": {
       "type": "string",
       "title": "Model",
-      "description": "Model alias used to generate method bodies and to extract plan structure when the plan has no plan-crutches block",
+      "description": "Model alias for the light calls: plan extraction when the plan has no plan-crutches block, picking the project files an implementation needs, and answers when the session cannot be forked",
       "default": "sonnet"
+    },
+    "bodyModel": {
+      "type": "string",
+      "title": "Implementation model",
+      "description": "Model alias that writes method bodies from the whole plan, the generated code and the project files. Empty means the Model option.",
+      "default": "opus"
     },
     "plansDir": {
       "type": "string",

@@ -205,10 +205,34 @@ function handleDemoAction(action) {
       break
     }
     case 'ask': {
-      const item = { id: id(), question: action.question, status: 'asking', ...(action.focus ? { focus: action.focus } : {}) }
+      const target = action.target && typeof action.target === 'object' && Object.keys(action.target).length ? action.target : undefined
+      const wanted = typeof action.id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(action.id) && !state.qa.some(one => one.id === action.id) ? action.id : id()
+      const item = {
+        id: wanted,
+        question: action.question,
+        status: 'asking',
+        createdInVersion: state.review.version,
+        ...(action.focus ? { focus: action.focus } : {}),
+        ...(target ? { target } : {}),
+      }
       state.qa = [...state.qa, item]
       setTimeout(() => {
-        state.qa = state.qa.map(one => (one.id === item.id ? { ...one, status: 'done', answer: `**Demo answer.** In the real flow Claude answers from the plan and the session.\n\nYou asked: _${action.question}_` } : one))
+        const about = target && target.selection ? `\n\nAbout the selected text: _${String(target.selection).slice(0, 120).replace(/\s+/g, ' ')}_` : ''
+        state.qa = state.qa.map(one => (one.id === item.id ? { ...one, status: 'done', answer: `**Demo answer.** In the real flow Claude answers from the plan and the session.${about}\n\nYou asked: _${action.question}_` } : one))
+        state.generatedAt = now()
+        broadcast()
+      }, 700)
+      break
+    }
+    case 'askMore': {
+      const turn = { id: id(), question: action.question, status: 'asking' }
+      state.qa = state.qa.map(one => (one.id === action.id ? { ...one, followups: [...(one.followups || []), turn] } : one))
+      setTimeout(() => {
+        state.qa = state.qa.map(one =>
+          one.id === action.id
+            ? { ...one, followups: (one.followups || []).map(t => (t.id === turn.id ? { ...t, status: 'done', answer: `**Demo follow-up answer.** The real flow continues the thread with Claude.\n\nYou asked: _${action.question}_` } : t)) }
+            : one,
+        )
         state.generatedAt = now()
         broadcast()
       }, 700)

@@ -44,6 +44,7 @@ const ui = {
   theme: stored('plan-crutches-theme', 'auto'),
   online: false,
   planKey: '',
+  replyOpen: new Set(),
 }
 
 let state = null
@@ -52,9 +53,53 @@ let diagram = null
 let diagramHost = null
 let lastNotice = 0
 let renderTimer = null
+let popupState = null
 
 const L = (key, params) => t(lang, key, params)
 const bodyKey = (path, symbol) => `${path}#${symbol}`
+const newId = () => Math.random().toString(36).slice(2, 10)
+
+// ---------- question threads ----------
+
+/** The turns of a thread in order: the first question, then every follow-up. */
+function qaTurns(item) {
+  return [{ id: item.id, question: item.question, answer: item.answer, status: item.status }, ...(item.followups || [])]
+}
+
+function threadBusy(item) {
+  return qaTurns(item).some(turn => turn.status === 'asking')
+}
+
+/** A thread as text, the shape a comment gets. */
+function threadTextOf(item, answerLimit = 1500) {
+  const lines = []
+  for (const turn of qaTurns(item)) {
+    if (turn.status !== 'done') continue
+    lines.push(`Q: ${turn.question}`)
+    lines.push(`A: ${(turn.answer || '').slice(0, answerLimit)}`)
+  }
+  return lines.join('\n')
+}
+
+function qaTarget(item) {
+  if (item.target && Object.keys(item.target).length) return { ...item.target }
+  return item.focus ? { path: item.focus } : {}
+}
+
+function renderTurn(turn, { pending = false } = {}) {
+  let reply
+  if (pending || turn.status === 'asking') reply = `<div class="msg assistant"><span class="who">${L('claude')}</span><div class="status"><span class="spinner"></span> ${L('asking')}</div></div>`
+  else if (turn.status === 'failed') reply = `<div class="msg assistant failed"><span class="who">${L('claude')}</span>${L('askFailed')}: ${escapeHtml(turn.answer || '')}</div>`
+  else reply = `<div class="msg assistant"><span class="who">${L('claude')}</span><div class="md" data-selectable data-scope="plan">${renderMarkdown(turn.answer || '', { imageUrl: projectUrl })}</div></div>`
+  return `<div class="msg user"><span class="who">${L('you')}</span>${escapeHtml(turn.question)}</div>${reply}`
+}
+
+function renderThread(item, pendingQuestion) {
+  const turns = item ? qaTurns(item) : []
+  let html = turns.map(turn => renderTurn(turn)).join('')
+  if (pendingQuestion) html += renderTurn({ question: pendingQuestion, status: 'asking' }, { pending: true })
+  return html ? `<div class="thread">${html}</div>` : ''
+}
 
 function applyTheme() {
   if (ui.theme === 'auto') delete document.documentElement.dataset.theme
@@ -346,27 +391,43 @@ function renderChanges() {
   return renderTask(plan) + renderSummary(plan) + renderWarnings(review) + `<div class="split">${renderTreePanel(plan)}<div class="detail">${detail}</div></div>`
 }
 
+function renderQaItem(item) {
+  const target = item.target && Object.keys(item.target).length ? item.target : null
+  const where = target ? describeTarget(target) : item.focus || ''
+  const followups = item.followups || []
+  const busy = threadBusy(item)
+  const replyOpen = ui.replyOpen.has(item.id) || followups.some(turn => turn.status === 'asking')
+  const open = target && target.path && !target.path.endsWith('/') ? ` data-action="open-file" data-path="${escapeHtml(target.path)}" style="cursor:pointer"` : ''
+  const answered = qaTurns(item).some(turn => turn.status === 'done')
+  const count = followups.length === 1 ? L('replyOne') : L('replies', { n: followups.length })
+  return (
+    `<div class="qa" data-qa="${item.id}">` +
+    (where
+      ? `<div class="focus"><span${open}>${escapeHtml(where)}</span>${followups.length ? `<span class="chip count">${count}</span>` : ''}</div>`
+      : followups.length
+        ? `<div class="focus"><span class="chip count">${count}</span></div>`
+        : '') +
+    (target && target.selection ? `<div class="quote">${escapeHtml(target.selection.slice(0, 600))}</div>` : '') +
+    renderThread(item) +
+    `<div class="qa-actions">` +
+    (answered ? `<button class="btn small" data-action="qa-comment" data-id="${item.id}">💬 ${L('threadToComment')}</button>` : '') +
+    (!replyOpen && !busy ? `<button class="btn small ghost" data-action="qa-reply-open" data-id="${item.id}">↩ ${L('reply')}</button>` : '') +
+    `</div>` +
+    (replyOpen
+      ? `<div class="reply"><textarea data-draft="reply:${item.id}" data-reply="${item.id}" placeholder="${escapeHtml(L('replyPlaceholder'))}"></textarea>` +
+        `<button class="btn primary small" data-action="qa-reply" data-id="${item.id}" ${busy ? 'disabled' : ''}>${L('send')}</button></div>`
+      : '') +
+    `</div>`
+  )
+}
+
 function renderAsk() {
   const items = [...state.qa].reverse()
   return (
-    `<section class="card"><div class="ask-form"><textarea id="ask-input" placeholder="${escapeHtml(L('askPlaceholder'))}"></textarea><button class="btn primary" data-action="ask" ${state.plan ? '' : 'disabled'}>${L('ask')}</button></div>` +
+    `<section class="card"><div class="ask-form"><textarea id="ask-input" data-draft="ask" placeholder="${escapeHtml(L('askPlaceholder'))}"></textarea><button class="btn primary" data-action="ask" ${state.plan ? '' : 'disabled'}>${L('ask')}</button></div>` +
     (ui.selected ? `<div class="hint">${L('anchor')}: ${escapeHtml(ui.selected)}</div>` : '') +
     `</section>` +
-    items
-      .map(item => {
-        let answer = ''
-        if (item.status === 'asking') answer = `<div class="status hint"><span class="spinner"></span> ${L('asking')}</div>`
-        else if (item.status === 'failed') answer = `<div class="hint">${L('askFailed')}: ${escapeHtml(item.answer || '')}</div>`
-        else answer = `<div class="a md" data-selectable data-scope="plan">${renderMarkdown(item.answer || '', { imageUrl: projectUrl })}</div>`
-        return (
-          `<div class="qa"><div class="q">${escapeHtml(item.question)}</div>` +
-          (item.focus ? `<div class="focus">${escapeHtml(item.focus)}</div>` : '') +
-          answer +
-          (item.status === 'done' ? `<div class="qa-actions"><button class="btn small" data-action="qa-comment" data-id="${item.id}">💬 ${L('makeComment')}</button></div>` : '') +
-          `</div>`
-        )
-      })
-      .join('')
+    items.map(renderQaItem).join('')
   )
 }
 
@@ -406,7 +467,13 @@ function render() {
     renderTimer = setTimeout(render, 300)
     return
   }
-  const askDraft = document.getElementById('ask-input')?.value
+  // Drafts in every textarea survive the redraw, and the focused one keeps focus.
+  const drafts = new Map()
+  let focusedDraft = null
+  for (const area of app.querySelectorAll('textarea[data-draft]')) {
+    drafts.set(area.dataset.draft, area.value)
+    if (document.activeElement === area) focusedDraft = { key: area.dataset.draft, start: area.selectionStart, end: area.selectionEnd }
+  }
   const scrollY = window.scrollY
   const treeScroll = document.querySelector('.tree-panel')?.scrollTop ?? 0
   let main = ''
@@ -414,17 +481,47 @@ function render() {
   else if (ui.tab === 'diagram') main = `<div id="diagram-slot"></div>`
   else if (ui.tab === 'ask') main = renderAsk()
   else main = renderComments()
-  app.innerHTML = renderHeader() + renderTabs() + renderBanner() + `<main>${main}</main>`
-  if (askDraft !== undefined) {
-    const input = document.getElementById('ask-input')
-    if (input) input.value = askDraft
+  app.innerHTML = `<div class="topbar${scrollY > 4 ? ' scrolled' : ''}">${renderHeader()}${renderTabs()}</div>` + renderBanner() + `<main>${main}</main>`
+  for (const area of app.querySelectorAll('textarea[data-draft]')) {
+    if (drafts.has(area.dataset.draft)) area.value = drafts.get(area.dataset.draft)
+    if (focusedDraft && focusedDraft.key === area.dataset.draft) {
+      area.focus({ preventScroll: true })
+      try {
+        area.setSelectionRange(focusedDraft.start, focusedDraft.end)
+      } catch {
+        // a disabled textarea takes no caret
+      }
+    }
   }
   if (ui.tab === 'diagram') ensureDiagram()
   window.scrollTo(0, scrollY)
   const panel = document.querySelector('.tree-panel')
   if (panel) panel.scrollTop = treeScroll
+  measureTopbar()
   requestFileIfNeeded()
 }
+
+// The tree panel sticks right under the floating header, whatever its height.
+const topbarObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(() => measureTopbar()) : null
+
+function measureTopbar() {
+  const topbar = app.querySelector('.topbar')
+  if (!topbar) return
+  document.documentElement.style.setProperty('--topbar-h', `${topbar.offsetHeight}px`)
+  if (topbarObserver) {
+    topbarObserver.disconnect()
+    topbarObserver.observe(topbar)
+  }
+}
+
+window.addEventListener(
+  'scroll',
+  () => {
+    const topbar = app.querySelector('.topbar')
+    if (topbar) topbar.classList.toggle('scrolled', window.scrollY > 4)
+  },
+  { passive: true },
+)
 
 function requestFileIfNeeded() {
   if (!state?.plan || !ui.selected) return
@@ -457,35 +554,109 @@ function onState(next) {
     toast(next.notice.text)
   }
   render()
+  // The popup follows its own thread: the answer arrives with the state.
+  if (popupState && popupState.mode === 'ask' && popupState.qaId) renderPopup()
 }
 
 // ---------- popup ----------
+// One floating window with two tabs. Comment saves a review comment on the
+// target. Ask opens a question thread about the same target; the thread goes
+// on in the window and is kept in the Ask tab, and can end up as a comment.
 
-function openPopup({ title, target, selection, prefill, at }) {
+function openPopup({ title, target, selection, prefill, at, mode = 'comment' }) {
+  popupState = { title, target: target || {}, selection: selection || '', prefill: prefill || '', at, mode, qaId: null, pending: null }
+  renderPopup({ focus: true })
+}
+
+function popupThread() {
+  if (!popupState || !popupState.qaId || !state) return null
+  return state.qa.find(one => one.id === popupState.qaId) || null
+}
+
+/** The question the popup is waiting for, until the state shows it. */
+function popupPending() {
+  const { pending } = popupState
+  if (!pending) return ''
+  const item = popupThread()
+  const turns = item ? qaTurns(item).length : 0
+  if (turns > pending.turns) {
+    popupState.pending = null
+    return ''
+  }
+  return pending.question
+}
+
+function renderPopup({ focus = false, keepDraft = true } = {}) {
+  if (!popupState) return
+  const { title, target, selection, mode } = popupState
+  const current = popup.querySelector('textarea')
+  const draft = keepDraft && current ? current.value : popupState.prefill
+  const hadFocus = current && document.activeElement === current
+  popupState.prefill = ''
+  const item = mode === 'ask' ? popupThread() : null
+  const pending = mode === 'ask' ? popupPending() : ''
+  const busy = Boolean(pending) || (item ? threadBusy(item) : false)
+  const answered = item ? qaTurns(item).some(turn => turn.status === 'done') : false
+  const tabs =
+    `<div class="ptabs">` +
+    `<button class="ptab${mode === 'comment' ? ' active' : ''}" data-popup="mode" data-mode="comment">💬 ${L('popupComment')}</button>` +
+    `<button class="ptab${mode === 'ask' ? ' active' : ''}" data-popup="mode" data-mode="ask">? ${L('popupAsk')}</button>` +
+    `</div>`
+  let body
+  if (mode === 'comment') {
+    body =
+      `<textarea id="popup-text" placeholder="${escapeHtml(L('commentPlaceholder'))}"></textarea>` +
+      `<div class="pactions"><span class="hint"><kbd>Enter</kbd> ${L('save')} · <kbd>Esc</kbd> ${L('cancel')}</span>` +
+      `<button class="btn" data-popup="cancel">${L('cancel')}</button><button class="btn primary" data-popup="save">${L('save')}</button></div>`
+  } else {
+    // The textarea stays enabled while an answer is on its way, so it keeps
+    // the focus and the next question can be typed; sending waits.
+    body =
+      renderThread(item, pending) +
+      `<textarea id="popup-text" placeholder="${escapeHtml(item || pending ? L('replyPlaceholder') : L('askSelectionPlaceholder'))}"></textarea>` +
+      `<div class="pactions"><span class="hint"><kbd>Enter</kbd> ${L('send')} · <kbd>Esc</kbd> ${L('close')}</span>` +
+      (answered ? `<button class="btn" data-popup="thread-comment">💬 ${L('threadToComment')}</button>` : '') +
+      `<button class="btn" data-popup="cancel">${L('close')}</button><button class="btn primary" data-popup="send" ${busy ? 'disabled' : ''}>${L('send')}</button></div>`
+  }
+  popup.className = `popup mode-${mode}`
   popup.innerHTML =
     `<div class="ptitle"><span>${escapeHtml(title)}</span><span class="spacer"></span><button class="btn ghost small" data-popup="cancel">✕</button></div>` +
-    (selection ? `<div class="pquote">${escapeHtml(selection)}</div>` : '') +
-    `<textarea id="popup-text" placeholder="${escapeHtml(L('commentPlaceholder'))}">${escapeHtml(prefill || '')}</textarea>` +
-    `<div class="pactions"><span class="hint"><kbd>Enter</kbd> ${L('save')} · <kbd>Esc</kbd> ${L('cancel')}</span>` +
-    `<button class="btn" data-popup="cancel">${L('cancel')}</button><button class="btn primary" data-popup="save">${L('save')}</button></div>`
+    (selection && !(mode === 'ask' && (item || pending)) ? `<div class="pquote">${escapeHtml(selection)}</div>` : '') +
+    tabs +
+    body
   popup.hidden = false
-  popup.dataset.target = JSON.stringify(target || {})
-  popup.dataset.selection = selection || ''
+  const textarea = popup.querySelector('textarea')
+  if (draft) textarea.value = draft
+  const thread = popup.querySelector('.thread')
+  if (thread) thread.scrollTop = thread.scrollHeight
+  placePopup()
+  if (focus || hadFocus) {
+    textarea.focus({ preventScroll: true })
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length)
+  }
+}
+
+function placePopup() {
+  const { at } = popupState
   const width = popup.offsetWidth
   const height = popup.offsetHeight
-  let left = Math.min(Math.max(12, at.x), window.innerWidth - width - 12)
+  const left = Math.min(Math.max(12, at.x), window.innerWidth - width - 12)
   let top = at.y + 10
-  if (top + height > window.innerHeight - 12) top = Math.max(12, at.y - height - 10)
+  if (top + height > window.innerHeight - 12) top = Math.max(12, Math.min(at.y - height - 10, window.innerHeight - height - 12))
   popup.style.left = `${left}px`
   popup.style.top = `${top}px`
-  const textarea = popup.querySelector('textarea')
-  textarea.focus()
-  textarea.setSelectionRange(textarea.value.length, textarea.value.length)
 }
 
 function closePopup() {
+  popupState = null
   popup.hidden = true
   popup.innerHTML = ''
+}
+
+function popupTarget() {
+  const target = { ...popupState.target }
+  if (popupState.selection) target.selection = popupState.selection.slice(0, 2000)
+  return target
 }
 
 async function savePopup() {
@@ -493,24 +664,72 @@ async function savePopup() {
   if (!textarea) return
   const text = textarea.value.trim()
   if (!text) return closePopup()
-  const target = JSON.parse(popup.dataset.target || '{}')
-  const selection = popup.dataset.selection
-  if (selection) target.selection = selection.slice(0, 2000)
+  const target = popupTarget()
   closePopup()
   await run({ type: 'comment', target, text })
+}
+
+function sendPopupQuestion() {
+  const textarea = popup.querySelector('textarea')
+  if (!textarea) return
+  const question = textarea.value.trim()
+  if (!question) return
+  const item = popupThread()
+  if (popupPending() || (item && threadBusy(item))) return
+  textarea.value = ''
+  if (item) {
+    popupState.pending = { question, turns: qaTurns(item).length }
+    void run({ type: 'askMore', id: item.id, question })
+  } else {
+    const id = newId()
+    popupState.qaId = id
+    popupState.pending = { question, turns: 0 }
+    const target = popupTarget()
+    void run({ type: 'ask', id, question, ...(Object.keys(target).length ? { target } : {}), ...(ui.selected ? { focus: ui.selected } : {}) })
+  }
+  renderPopup({ keepDraft: false })
+}
+
+/** Carries the thread into the Comment tab, as the comment's text. */
+function threadToComment() {
+  const item = popupThread()
+  if (!item) return
+  popupState.mode = 'comment'
+  popupState.prefill = threadTextOf(item)
+  popupState.target = qaTarget(item)
+  if (item.target && item.target.selection) popupState.selection = item.target.selection
+  renderPopup({ focus: true, keepDraft: false })
 }
 
 popup.addEventListener('click', event => {
   const button = event.target.closest('[data-popup]')
   if (!button) return
-  if (button.dataset.popup === 'save') savePopup()
-  else closePopup()
+  switch (button.dataset.popup) {
+    case 'save':
+      savePopup()
+      break
+    case 'send':
+      sendPopupQuestion()
+      break
+    case 'mode':
+      if (popupState && popupState.mode !== button.dataset.mode) {
+        popupState.mode = button.dataset.mode
+        renderPopup({ focus: true })
+      }
+      break
+    case 'thread-comment':
+      threadToComment()
+      break
+    default:
+      closePopup()
+  }
 })
 
 popup.addEventListener('keydown', event => {
-  if (event.key === 'Enter' && !event.shiftKey) {
+  if (event.key === 'Enter' && !event.shiftKey && event.target.tagName === 'TEXTAREA') {
     event.preventDefault()
-    savePopup()
+    if (popupState && popupState.mode === 'ask') sendPopupQuestion()
+    else savePopup()
   } else if (event.key === 'Escape') {
     event.preventDefault()
     closePopup()
@@ -549,7 +768,7 @@ function checkSelection() {
   }
   const rect = range.getBoundingClientRect()
   const where = target.path ? `${target.path}${target.symbol ? ` · ${target.symbol}` : ''}` : L('plan')
-  openPopup({ title: `${L('commentOnSelection')} · ${where}${target.lines ? ` · ${L('linesSelected', { n: target.lines[1] - target.lines[0] + 1 })}` : ''}`, target, selection: text.slice(0, 2000), at: { x: rect.left, y: rect.bottom } })
+  openPopup({ title: `${L('selection')} · ${where}${target.lines ? ` · ${L('linesSelected', { n: target.lines[1] - target.lines[0] + 1 })}` : ''}`, target, selection: text.slice(0, 2000), at: { x: rect.left, y: rect.bottom } })
 }
 
 document.addEventListener('mouseup', event => {
@@ -591,9 +810,15 @@ app.addEventListener('click', event => {
 })
 
 app.addEventListener('keydown', event => {
-  if (event.target.id === 'ask-input' && event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+  if (event.key !== 'Enter' || event.target.tagName !== 'TEXTAREA') return
+  // Enter sends, Shift+Enter adds a line; Cmd/Ctrl+Enter sends too.
+  if (event.shiftKey) return
+  if (event.target.id === 'ask-input') {
     event.preventDefault()
     submitQuestion()
+  } else if (event.target.dataset.reply) {
+    event.preventDefault()
+    sendReply(event.target.dataset.reply)
   }
 })
 
@@ -603,7 +828,17 @@ function submitQuestion() {
   const question = input.value.trim()
   if (!question) return
   input.value = ''
-  run({ type: 'ask', question, ...(ui.selected ? { focus: ui.selected } : {}) })
+  run({ type: 'ask', id: newId(), question, ...(ui.selected ? { focus: ui.selected } : {}) })
+}
+
+function sendReply(id) {
+  const input = app.querySelector(`textarea[data-reply="${id}"]`)
+  const item = state && state.qa.find(one => one.id === id)
+  if (!input || !item || threadBusy(item)) return
+  const question = input.value.trim()
+  if (!question) return
+  input.value = ''
+  run({ type: 'askMore', id, question })
 }
 
 function handleAction(control) {
@@ -611,6 +846,7 @@ function handleAction(control) {
   const data = control.dataset
   switch (action) {
     case 'tab':
+      if (ui.tab !== data.tab) window.scrollTo(0, 0)
       ui.tab = data.tab
       render()
       break
@@ -654,17 +890,17 @@ function handleAction(control) {
       selectFile(data.path)
       break
     case 'comment-plan':
-      openPopup({ title: L('planComment'), target: {}, at: rectOf(control) })
+      openPopup({ title: L('plan'), target: {}, at: rectOf(control) })
       break
     case 'comment-node':
-      if (data.kind === 'dir') openPopup({ title: `${L('commentOnFolder')} · ${data.path}/`, target: { path: `${data.path}/` }, at: rectOf(control) })
-      else openPopup({ title: `${L('commentOnFile')} · ${data.path}`, target: { path: data.path }, at: rectOf(control) })
+      if (data.kind === 'dir') openPopup({ title: `${L('folder')} · ${data.path}/`, target: { path: `${data.path}/` }, at: rectOf(control) })
+      else openPopup({ title: data.path, target: { path: data.path }, at: rectOf(control) })
       break
     case 'comment-file':
-      openPopup({ title: `${L('commentOnFile')} · ${data.path}`, target: { path: data.path }, at: rectOf(control) })
+      openPopup({ title: data.path, target: { path: data.path }, at: rectOf(control) })
       break
     case 'comment-symbol':
-      openPopup({ title: `${L('commentOnSymbol')} · ${data.symbol}`, target: { path: data.path, symbol: data.symbol }, at: rectOf(control) })
+      openPopup({ title: `${data.path} · ${data.symbol}`, target: { path: data.path, symbol: data.symbol }, at: rectOf(control) })
       break
     case 'expand': {
       const key = bodyKey(data.path, data.symbol)
@@ -713,10 +949,21 @@ function handleAction(control) {
     case 'qa-comment': {
       const item = state.qa.find(one => one.id === data.id)
       if (!item) break
-      const prefill = `Q: ${item.question}\nA: ${(item.answer || '').slice(0, 600)}`
-      openPopup({ title: L('planComment'), target: item.focus ? { path: item.focus } : {}, prefill, at: rectOf(control) })
+      const target = qaTarget(item)
+      const selection = target.selection || ''
+      delete target.selection
+      const where = Object.keys(target).length ? describeTarget(target) : L('plan')
+      openPopup({ title: where, target, selection, prefill: threadTextOf(item), at: rectOf(control) })
       break
     }
+    case 'qa-reply-open':
+      ui.replyOpen.add(data.id)
+      render()
+      app.querySelector(`textarea[data-reply="${data.id}"]`)?.focus()
+      break
+    case 'qa-reply':
+      sendReply(data.id)
+      break
     default:
       break
   }

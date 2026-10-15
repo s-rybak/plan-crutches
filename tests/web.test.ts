@@ -16,6 +16,16 @@ describe('web bridge helpers', () => {
     expect(parseAction({ type: 'comment', text: '   ' })).toBe(null)
     expect(parseAction({ type: 'generateBody', path: 'a.ts', symbol: 'f' })).toEqual({ type: 'generateBody', path: 'a.ts', symbol: 'f' })
     expect(parseAction({ type: 'ask', question: 'Why?', focus: 'a.ts' })).toEqual({ type: 'ask', question: 'Why?', focus: 'a.ts' })
+    expect(parseAction({ type: 'ask', id: 'q1', question: 'Why?', target: { path: 'a.ts', symbol: 'f', selection: 'x', lines: [3, 1] } })).toEqual({
+      type: 'ask',
+      id: 'q1',
+      question: 'Why?',
+      target: { path: 'a.ts', symbol: 'f', selection: 'x', lines: [1, 3] },
+    })
+    expect(parseAction({ type: 'ask', id: 'bad id!', question: 'Why?', target: {} })).toEqual({ type: 'ask', question: 'Why?' })
+    expect(parseAction({ type: 'askMore', id: 'q1', question: '  And then? ' })).toEqual({ type: 'askMore', id: 'q1', question: 'And then?' })
+    expect(parseAction({ type: 'askMore', id: 'q1', question: ' ' })).toBe(null)
+    expect(parseAction({ type: 'askMore', question: 'x' })).toBe(null)
     expect(parseAction({ type: 'setLang', lang: 'fr' })).toEqual({ type: 'setLang', lang: 'en' })
     expect(parseAction({ type: 'canvasSvg', svg: 'nope' })).toBe(null)
     expect(parseAction({ type: 'explode' })).toBe(null)

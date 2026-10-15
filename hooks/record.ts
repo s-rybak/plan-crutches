@@ -1,5 +1,5 @@
-import type { Canvas, PlanModel, Review, ReviewComment } from '../types'
-import { canvasText } from './prompts'
+import type { Canvas, PlanModel, QaItem, Review, ReviewComment } from '../types'
+import { canvasText, describeQaTarget, threadText } from './prompts'
 
 export function slugify(text: string): string {
   return text
@@ -35,9 +35,11 @@ export function renderRecord(args: {
   review: Review
   comments: readonly ReviewComment[]
   canvas: Canvas
+  qa?: readonly QaItem[]
   nowMs: number
 }): string {
   const { plan, review, comments, canvas, nowMs } = args
+  const qa = args.qa ?? []
   const out: string[] = []
   out.push(`# ${plan.title}`)
   out.push('')
@@ -80,6 +82,22 @@ export function renderRecord(args: {
     out.push('')
     for (const comment of comments.filter(one => one.createdInVersion === version)) out.push(commentLine(comment))
     out.push('')
+  }
+  const answered = qa.filter(item => item.status === 'done')
+  if (answered.length) {
+    out.push('## Questions')
+    out.push('')
+    for (const item of answered) {
+      const where = describeQaTarget(item.target) || item.focus || ''
+      out.push(`### ${item.question.split('\n')[0]?.slice(0, 120) ?? 'Question'}${where ? ` (${where})` : ''}`)
+      out.push('')
+      if (item.target?.selection) {
+        out.push('> ' + item.target.selection.slice(0, 600).split('\n').join('\n> '))
+        out.push('')
+      }
+      out.push(threadText(item, 4000))
+      out.push('')
+    }
   }
   const diagram = canvasText(canvas)
   if (diagram) {

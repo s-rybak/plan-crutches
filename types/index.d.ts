@@ -92,12 +92,30 @@ export type GeneratedBody = {
   error?: string
 }
 
+export type QaStatus = 'asking' | 'done' | 'failed'
+
+/** One follow-up turn under a question: the reply the user typed and its answer. */
+export type QaFollowup = {
+  id: string
+  question: string
+  answer?: string
+  status: QaStatus
+}
+
+/**
+ * A question thread. The first question and its answer live on the item
+ * itself; later turns are `followups`. `target` is the text the user selected
+ * when the question came from the selection popup.
+ */
 export type QaItem = {
   id: string
   question: string
   answer?: string
-  status: 'asking' | 'done' | 'failed'
+  status: QaStatus
   focus?: string
+  target?: CommentTarget
+  followups?: QaFollowup[]
+  createdInVersion?: number
 }
 
 export type CanvasNode = { id: string; x: number; y: number; w: number; h: number; label: string; kind?: 'box' | 'text' }

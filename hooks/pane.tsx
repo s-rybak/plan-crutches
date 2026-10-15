@@ -16,6 +16,7 @@ import type {
 import { deletedDiff, newFileStub, stubDiff } from './diff'
 import { otherLang, statusLabel, t } from './i18n'
 import type { StringKey } from './i18n'
+import { threadText } from './prompts'
 import type { SelectableProps } from './select'
 import { bodyKey } from './state'
 import { allDirKeys, buildTree, pathsUnder, visibleRows } from './tree'
@@ -600,12 +601,24 @@ function renderAsk(ctx: Ctx) {
               </Text>
             )}
             {item.status === 'done' && <Markdown text={item.answer ?? ''} />}
+            {(item.followups ?? []).map(turn => (
+              <Box flexDirection="column" marginLeft={2} marginTop={1}>
+                <Text bold>↳ {turn.question}</Text>
+                {turn.status === 'asking' && <Text dimColor>{t(lang, 'asking')}</Text>}
+                {turn.status === 'failed' && (
+                  <Text color="error">
+                    {t(lang, 'askFailed')}: {turn.answer ?? ''}
+                  </Text>
+                )}
+                {turn.status === 'done' && <Markdown text={turn.answer ?? ''} />}
+              </Box>
+            ))}
             {item.status === 'done' && (
               <Button
                 key={`qa-comment:${item.id}`}
                 plain
                 dimColor
-                onPress={() => a.addComment(item.focus ? { path: item.focus } : {}, `Q: ${item.question}\nA: ${item.answer ?? ''}`)}
+                onPress={() => a.addComment(item.target ?? (item.focus ? { path: item.focus } : {}), threadText(item))}
               >
                 {t(lang, 'makeComment')}
               </Button>
