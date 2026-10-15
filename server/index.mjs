@@ -227,7 +227,18 @@ function handleDemoAction(action) {
   broadcast()
 }
 
+// A browser on a site that resolves its name to 127.0.0.1 (DNS rebinding)
+// would reach this port with that site's name in Host. Only local names pass.
+const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]', HOST])
+
+function localHost(req) {
+  const raw = String(req.headers.host || '')
+  const name = raw.startsWith('[') ? raw.slice(0, raw.indexOf(']') + 1) : raw.split(':')[0]
+  return LOCAL_HOSTS.has(name.toLowerCase())
+}
+
 async function handle(req, res) {
+  if (!localHost(req)) return send(res, 403, 'bad host')
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
   const pathname = decodeURIComponent(url.pathname)
 

@@ -58,7 +58,7 @@ Set them in `/config` or in `settings.json` under `pluginConfigs.plan-crutches.o
 
 ## Security of the page
 
-The server binds to `127.0.0.1` only. Every API call carries a token that the mod makes once per session; the page gets it from the link and keeps it in local storage. Project files are served under `/project/` with the same token, for images in the summary, and never outside the project folder.
+The server binds to `127.0.0.1` only and answers only requests whose `Host` header names the local machine, so a web site that points its name at `127.0.0.1` gets a 403. Every API call carries a token that the mod makes once per session. The page gets the token from the link, keeps it in local storage and then removes it from the address bar. Project files are served under `/project/` with the same token, for images in the summary and for the Full file view, and never outside the project folder. The state the mod pushes holds the plan and the signature diffs, not the text of the project files.
 
 ## Run it from this folder
 
@@ -91,10 +91,10 @@ claude plugin test .
 ```
 
 ```bash
-node --test tests/server.node.mjs
+node --test tests/server.node.mjs tests/page.node.mjs
 ```
 
-The first two need Claude Code 2.1.275 or newer. The last one checks the page server end to end.
+The first two need Claude Code 2.1.275 or newer. The last one checks the page server end to end and the page modules that render Markdown, code, diffs and the tree.
 
 ## Limits
 

@@ -4,7 +4,12 @@ function readToken() {
   const url = new URL(location.href)
   const given = url.searchParams.get('t')
   try {
-    if (given) localStorage.setItem('plan-crutches-token', given)
+    if (given) {
+      localStorage.setItem('plan-crutches-token', given)
+      // Stored, so the token can leave the address bar and the history.
+      url.searchParams.delete('t')
+      history.replaceState(history.state, '', url.pathname + url.search + url.hash)
+    }
     return given || localStorage.getItem('plan-crutches-token') || ''
   } catch {
     return given || ''

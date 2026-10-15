@@ -89,7 +89,7 @@ function renderBodyBlock(inline, symbol, code, { diff }) {
     if (diff) classes.push('add')
     if (commented.has(number)) classes.push('commented')
     const numbers = diff ? `<span class="ln old"></span><span class="ln">${number}</span><span class="sign">+</span>` : `<span class="ln">${number}</span>`
-    return `<div class="${classes.join(' ')}" data-line="${number}"><span class="ln-gen"></span>${numbers}<span class="src">${marked[index] ?? ''}</span></div>`
+    return `<div class="${classes.join(' ')}" data-line="${number}"><span class="ln-gen"></span>${numbers}<span class="src">${marked[index] ?? ''}</span>${index === 0 ? actionsFor(inline, symbol) : ''}</div>`
   })
   return `<div class="inline-body" data-selectable data-scope="code" data-path="${escapeHtml(inline.path)}" data-symbol="${escapeHtml(symbol.name)}">${rows.join('')}</div>`
 }

@@ -201,8 +201,6 @@ export function openCommands(url: string): string[][] {
   ]
 }
 
-const MAX_CONTENT = 400_000
-
 export function fileEntries(plan: PlanModel | null, files: FileCache): Record<string, WebFileEntry> {
   const entries: Record<string, WebFileEntry> = {}
   if (!plan) return entries
@@ -217,11 +215,11 @@ export function fileEntries(plan: PlanModel | null, files: FileCache): Record<st
     }
     const content = files[file.path]
     if (typeof content !== 'string') {
-      entries[file.path] = { loaded: true, content: null, missing: true }
+      entries[file.path] = { loaded: true, missing: true }
       continue
     }
     const text = file.status === 'deleted' ? deletedDiff(content) : stubDiff(content, file)
-    entries[file.path] = { loaded: true, content: content.slice(0, MAX_CONTENT), view: { format: 'diff', text } }
+    entries[file.path] = { loaded: true, view: { format: 'diff', text } }
   }
   return entries
 }

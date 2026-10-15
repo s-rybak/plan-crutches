@@ -2,6 +2,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import http from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -84,6 +85,19 @@ test('serves the page, syncs state and relays actions', async () => {
     assert.equal(inside.status, 200)
     const traversal = await fetch(`${base}/..%2F..%2Fetc%2Fpasswd`)
     assert.ok(traversal.status === 403 || traversal.status === 404)
+
+    // fetch() refuses to set Host, so a raw request plays the rebinding site.
+    const withHost = host => new Promise((resolve, reject) => {
+      const request = http.request(`${base}/api/state?t=testtoken`, { headers: { host } }, response => {
+        response.resume()
+        resolve(response.statusCode)
+      })
+      request.on('error', reject)
+      request.end()
+    })
+    assert.equal(await withHost('evil.example:80'), 403)
+    assert.equal(await withHost(`localhost:${listening.port}`), 200)
+    assert.equal(await withHost(`[::1]:${listening.port}`), 200)
     reader.cancel()
   } finally {
     server.child.kill('SIGTERM')

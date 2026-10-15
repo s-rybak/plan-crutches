@@ -36,6 +36,7 @@ const ui = {
   expanded: new Set(),
   inlineExpanded: new Set(),
   fullFile: new Set(),
+  fullText: new Map(),
   requested: new Set(),
   showFullSummary: false,
   showTask: true,
@@ -74,6 +75,28 @@ async function run(action) {
   } catch (error) {
     toast(L('actionFailed', { error: error.message || String(error) }))
   }
+}
+
+// The full text of a file is not in the state: the page reads it from the
+// server's /project/ route the first time the Full file button is pressed.
+async function loadFullFile(path) {
+  if (ui.fullText.has(path)) return
+  ui.fullText.set(path, { status: 'loading' })
+  try {
+    const response = await fetch(projectUrl(path))
+    if (!response.ok) throw new Error(String(response.status))
+    ui.fullText.set(path, { status: 'ready', text: await response.text() })
+  } catch {
+    ui.fullText.set(path, { status: 'failed' })
+  }
+  render()
+}
+
+function renderFullFile(path) {
+  const full = ui.fullText.get(path)
+  if (!full || full.status === 'loading') return `<div class="status hint"><span class="spinner"></span> ${L('loadingFile')}</div>`
+  if (full.status === 'failed') return `<div class="hint">${L('fileMissing')}</div>`
+  return block(renderSource(full.text, { path }), { path })
 }
 
 function pendingComments() {
@@ -289,17 +312,17 @@ function renderFile(file) {
     }
   } else if (!entry.loaded) {
     changes = `<div class="status hint"><span class="spinner"></span> ${L('loadingFile')}</div>`
-  } else if (entry.content === null || entry.missing) {
+  } else if (entry.missing) {
     changes = `<div class="hint">${L('fileMissing')}</div>`
   } else {
     const title = file.status === 'deleted' ? L('deletedFile') : L('diffTitle')
     const showFull = ui.fullFile.has(file.path)
     changes =
       `<div class="section-title">${title}<span class="spacer"></span>` +
-      (typeof entry.content === 'string' ? `<button class="btn ghost small" data-action="full-file" data-path="${escapeHtml(file.path)}">${showFull ? L('hideFullFile') : L('fullFile')}</button>` : '') +
+      `<button class="btn ghost small" data-action="full-file" data-path="${escapeHtml(file.path)}">${showFull ? L('hideFullFile') : L('fullFile')}</button>` +
       `</div>` +
       (entry.view ? block(renderDiff(entry.view.text, { path: file.path, commented: linesCommented(file.path), inline: file.status === 'modified' ? inline : null }), { path: file.path }) : '') +
-      (showFull && typeof entry.content === 'string' ? `<div class="section-title">${L('fullFile')}</div>` + block(renderSource(entry.content, { path: file.path }), { path: file.path }) : '')
+      (showFull ? `<div class="section-title">${L('fullFile')}</div>` + renderFullFile(file.path) : '')
   }
   const comments = state.comments.filter(one => one.target.path === file.path)
   return (
@@ -426,6 +449,7 @@ function onState(next) {
     ui.expanded.clear()
     ui.inlineExpanded.clear()
     ui.fullFile.clear()
+    ui.fullText.clear()
     if (ui.selected && !(next.plan && next.plan.files.some(one => one.path === ui.selected))) ui.selected = null
   }
   if (next.notice && next.notice.id !== lastNotice) {
@@ -674,7 +698,10 @@ function handleAction(control) {
       break
     case 'full-file':
       if (ui.fullFile.has(data.path)) ui.fullFile.delete(data.path)
-      else ui.fullFile.add(data.path)
+      else {
+        ui.fullFile.add(data.path)
+        void loadFullFile(data.path)
+      }
       render()
       break
     case 'delete-comment':

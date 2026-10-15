@@ -14,7 +14,7 @@ fs.writeFileSync(stateFile, state)
 process.env.PLAN_CRUTCHES_DEMO = stateFile
 process.env.PLAN_CRUTCHES_PORT = process.env.PLAN_CRUTCHES_PORT || '4818'
 process.env.PLAN_CRUTCHES_TOKEN = process.env.PLAN_CRUTCHES_TOKEN || 'demo'
-process.env.PLAN_CRUTCHES_PROJECT = path.join(here, '..')
+process.env.PLAN_CRUTCHES_PROJECT = path.join(here, '..', 'fixtures', 'demo-src')
 process.on('exit', () => {
   try {
     fs.unlinkSync(stateFile)

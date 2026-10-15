@@ -117,9 +117,9 @@ export type WebState = {
 
 export type WebFileView = { format: 'source' | 'diff'; text: string; startLine?: number }
 
+/** A file as the page sees it; the full text comes from /project/<path> on demand. */
 export type WebFileEntry = {
   loaded: boolean
-  content?: string | null
   missing?: boolean
   view?: WebFileView
 }
