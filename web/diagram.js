@@ -1,485 +1,410 @@
-// The diagram editor: boxes, arrows, free strokes and text labels on an SVG.
-// Local state first; changes reach the mod debounced through onChange.
+// The change diagram: the generated graph drawn as blocks on a tilted 3D board.
+// Each block is a file, colored by its status, with one row per symbol the
+// plan changes; the lines between rows are the calls. A click on a row asks
+// the mod for every caller of that symbol in the project and draws them as
+// new rows and blocks; a second click hides them. The plan's own blocks are
+// always drawn whole. Drag rotates the board, Shift+drag pans, the wheel zooms.
 import { t } from './i18n.js'
 import { escapeHtml } from './markdown.js'
+import { HEAD_H, PAD, ROW_H, layoutScene, pathD, rowKey } from './diagram-layout.js'
 
-const WIDTH = 1600
-const HEIGHT = 1000
-const NODE_W = 170
-const NODE_H = 66
-const TOOLS = ['select', 'box', 'arrow', 'pen', 'text', 'delete']
+const DEPTH = 14
+const HOME_VIEW = { spin: -24, tilt: 52 }
+const KIND_SHORT = { function: 'fn', method: 'fn', class: 'class', type: 'type', const: 'const', other: '' }
+const MARKERS = { plan: 'pc-arrow-plan', use: 'pc-arrow-use', callers: 'pc-arrow-callers', others: 'pc-arrow-others' }
 
-const newId = prefix => `${prefix}_${Math.random().toString(36).slice(2, 8)}`
-const clone = value => JSON.parse(JSON.stringify(value))
-const empty = () => ({ nodes: [], edges: [], strokes: [] })
+const clamp = (value, low, high) => Math.min(high, Math.max(low, value))
 
-function anchor(node, towardX, towardY) {
-  const cx = node.x + node.w / 2
-  const cy = node.y + node.h / 2
-  const dx = towardX - cx
-  const dy = towardY - cy
-  if (dx === 0 && dy === 0) return [cx, cy]
-  const sx = node.w ? node.w / 2 / Math.abs(dx || 1e-9) : Infinity
-  const sy = node.h ? node.h / 2 / Math.abs(dy || 1e-9) : Infinity
-  const scale = Math.min(sx, sy, 1)
-  return [cx + dx * scale, cy + dy * scale]
+function markerOf(edge) {
+  if (edge.origin === 'others') return MARKERS.others
+  if (edge.origin === 'callers') return MARKERS.callers
+  return edge.kind === 'use' ? MARKERS.use : MARKERS.plan
 }
 
-function wrapLabel(label, width) {
-  const perLine = Math.max(6, Math.floor(width / 8.6))
-  const words = String(label || '').split(/\s+/).filter(Boolean)
-  const lines = []
-  let current = ''
-  for (const word of words) {
-    if ((current + ' ' + word).trim().length > perLine && current) {
-      lines.push(current)
-      current = word
-    } else {
-      current = (current + ' ' + word).trim()
-    }
-  }
-  if (current) lines.push(current)
-  return lines.slice(0, 4)
-}
-
-export function mountDiagram(host, { lang, initial, onChange, onSaveSvg }) {
-  let canvas = initial ? clone(initial) : empty()
-  let known = JSON.stringify(canvas)
-  let tool = 'select'
-  let selected = null
-  let drag = null
-  let timer = null
-  let editor = null
+export function mountDiagram(host, { lang, onGenerate, onCallers, onOpenFile, onSaveSvg }) {
   let language = lang
+  let data = { plan: null, diagram: { status: 'idle', callers: {} }, review: { version: 0 } }
+  let known = ''
+  let scene = null
+  let drag = null
+  let fitPending = true
+  const expanded = new Set()
+  const view = { spin: HOME_VIEW.spin, tilt: HOME_VIEW.tilt, zoom: 1, panX: 0, panY: 0, flat: false }
 
-  host.innerHTML = `
-    <div class="diagram-toolbar"></div>
-    <div class="hint diagram-hint"></div>
-    <div class="diagram-wrap" style="position:relative">
-      <svg class="diagram" viewBox="0 0 ${WIDTH} ${HEIGHT}" preserveAspectRatio="xMinYMin meet" tabindex="0">
-        <defs>
-          <marker id="pc-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-            <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"></path>
-          </marker>
-        </defs>
-        <g class="layer-edges"></g>
-        <g class="layer-strokes"></g>
-        <g class="layer-nodes"></g>
-        <g class="layer-ghost"></g>
-      </svg>
-    </div>`
-  const toolbar = host.querySelector('.diagram-toolbar')
-  const hint = host.querySelector('.diagram-hint')
-  const wrap = host.querySelector('.diagram-wrap')
-  const svg = host.querySelector('svg')
-  const layers = {
-    edges: svg.querySelector('.layer-edges'),
-    strokes: svg.querySelector('.layer-strokes'),
-    nodes: svg.querySelector('.layer-nodes'),
-    ghost: svg.querySelector('.layer-ghost'),
+  host.innerHTML =
+    `<div class="d3-toolbar"></div>` +
+    `<div class="hint d3-hint"></div>` +
+    `<div class="d3-viewport"><div class="d3-stage"><div class="d3-scene"></div></div><div class="d3-empty" hidden></div></div>`
+  const toolbar = host.querySelector('.d3-toolbar')
+  const hint = host.querySelector('.d3-hint')
+  const viewport = host.querySelector('.d3-viewport')
+  const sceneEl = host.querySelector('.d3-scene')
+  const empty = host.querySelector('.d3-empty')
+
+  const L = (key, params) => t(language, key, params)
+  const graph = () => (data.diagram && data.diagram.status === 'ready' ? data.diagram.graph : null)
+  const queries = () => (data.diagram && data.diagram.callers) || {}
+
+  function applyView() {
+    const tilt = view.flat ? 0 : view.tilt
+    const spin = view.flat ? 0 : view.spin
+    sceneEl.style.transform = `translate(${view.panX}px, ${view.panY}px) scale(${view.zoom}) rotateX(${tilt}deg) rotateZ(${spin}deg)`
+    viewport.classList.toggle('flat', view.flat)
+  }
+
+  function fit() {
+    if (!scene) return
+    const rect = viewport.getBoundingClientRect()
+    if (rect.width < 50 || rect.height < 50) {
+      // not laid out yet (a detached host): fit once it is
+      fitPending = true
+      return
+    }
+    const zoomX = (rect.width - 40) / scene.width
+    const zoomY = (rect.height - 40) / (view.flat ? scene.height : scene.height * 0.9)
+    view.zoom = clamp(Math.min(zoomX, zoomY), 0.3, 1.1)
+    view.panX = 0
+    view.panY = 0
+    applyView()
   }
 
   function renderToolbar() {
+    const { diagram, review } = data
+    const status = diagram ? diagram.status : 'idle'
+    const ready = status === 'ready'
+    const loading = status === 'loading'
+    let note = ''
+    if (loading) note = `<span class="d3-status"><span class="spinner"></span>${L('diagramGenerating')}</span>`
+    else if (ready) {
+      const stale = diagram.version !== undefined && review && review.version !== diagram.version
+      const source = diagram.source ? ` · ${L(`diagramSource_${diagram.source}`)}` : ''
+      note = `<span class="d3-status${stale ? ' stale' : ''}">${stale ? L('diagramStale', { n: diagram.version, m: review.version }) : L('diagramFor', { n: diagram.version })}${escapeHtml(source)}</span>`
+    } else if (status === 'failed') note = `<span class="d3-status stale">${L('diagramFailed')}: ${escapeHtml(diagram.error || '')}</span>`
+    const legend =
+      `<span class="d3-legend">` +
+      `<span><i class="sw new"></i>${L('legendNew')}</span><span><i class="sw modified"></i>${L('legendModified')}</span>` +
+      `<span><i class="sw deleted"></i>${L('legendDeleted')}</span><span><i class="sw unchanged"></i>${L('legendUnchanged')}</span>` +
+      `<span><i class="ln"></i>${L('legendCall')}</span><span><i class="ln use"></i>${L('legendUse')}</span>` +
+      `</span>`
     toolbar.innerHTML =
-      TOOLS.map(name => `<button class="btn small${tool === name ? ' active' : ''}" data-tool="${name}">${t(language, `tool_${name}`)}</button>`).join('') +
+      `<button class="btn ${ready ? 'small' : 'primary'}" data-d3="generate" ${loading || !data.plan ? 'disabled' : ''}>${ready ? L('diagramRegenerate') : L('diagramGenerate')}</button>` +
+      note +
       `<span class="spacer"></span>` +
-      `<button class="btn small" data-diagram="clear">${t(language, 'clear')}</button>` +
-      `<button class="btn small" data-diagram="svg">${t(language, 'attachSvg')}</button>`
-    hint.textContent = t(language, 'diagramHint')
-    svg.className.baseVal = `diagram tool-${tool}`
+      (ready ? legend : '') +
+      (ready
+        ? `<button class="btn small${view.flat ? '' : ' active'}" data-d3="flat">${view.flat ? L('view3d') : L('view2d')}</button>` +
+          `<button class="btn small" data-d3="fit">${L('fitView')}</button>` +
+          `<button class="btn small" data-d3="svg">${L('attachSvg')}</button>`
+        : '')
+    hint.textContent = ready ? L('diagramHint') : ''
+    hint.hidden = !ready
   }
 
-  function nodeById(id) {
-    return canvas.nodes.find(node => node.id === id)
+  function renderEmpty() {
+    const status = data.diagram ? data.diagram.status : 'idle'
+    if (status === 'ready') {
+      empty.hidden = true
+      empty.innerHTML = ''
+      return
+    }
+    let inner
+    if (status === 'loading') inner = `<div><span class="spinner big"></span><p>${L('diagramGenerating')}</p></div>`
+    else if (status === 'failed') inner = `<div><p class="error">${L('diagramFailed')}: ${escapeHtml(data.diagram.error || '')}</p><button class="btn primary" data-d3="generate">${L('diagramRegenerate')}</button></div>`
+    else inner = `<div><p>${L('diagramEmpty')}</p><button class="btn primary" data-d3="generate" ${data.plan ? '' : 'disabled'}>${L('diagramGenerate')}</button></div>`
+    empty.innerHTML = inner
+    empty.hidden = false
   }
 
-  function edgePath(edge) {
-    const from = nodeById(edge.from)
-    const to = nodeById(edge.to)
-    if (!from || !to) return null
-    const [x1, y1] = anchor(from, to.x + to.w / 2, to.y + to.h / 2)
-    const [x2, y2] = anchor(to, from.x + from.w / 2, from.y + from.h / 2)
-    return { x1, y1, x2, y2 }
+  function rowTail(row, block) {
+    if (!row.planned && block.kind !== 'file') return ''
+    const key = row.key
+    const query = queries()[key]
+    const open = expanded.has(key)
+    if (open && query && query.status === 'loading') return `<span class="d3-tail"><span class="spinner"></span></span>`
+    if (open && query && query.status === 'ready') {
+      const total = query.callers.length + query.more
+      const label = total ? L('callersCount', { n: total }) : L('callersNone')
+      const title = query.source === 'search' ? L('callersSource_search') : query.source === 'model' ? L('callersSource_model') : ''
+      return `<span class="d3-tail" title="${escapeHtml(title)}"><span class="chip count">${escapeHtml(label)}</span><span class="caret">▾</span></span>`
+    }
+    if (open && query && query.status === 'failed') return `<span class="d3-tail error" title="${escapeHtml(query.error || '')}">${L('callersFailed')}</span>`
+    return `<span class="d3-tail"><span class="caret">▸</span></span>`
+  }
+
+  function renderBlock(block) {
+    const faces = `<div class="d3-face top"></div><div class="d3-face bottom"></div><div class="d3-face left"></div><div class="d3-face right"></div>`
+    const style = `left:${block.x}px;top:${block.y}px;width:${block.w}px;height:${block.h}px`
+    if (block.kind === 'others') {
+      return (
+        `<div class="d3-block others" style="${style}" data-block="${escapeHtml(block.id)}">${faces}` +
+        `<div class="d3-head"><span class="d3-path">⋯ ${escapeHtml(L('callersOthers', { n: block.count }))}</span></div></div>`
+      )
+    }
+    const name = block.path.split('/').pop() || block.path
+    const dir = block.path.slice(0, block.path.length - name.length)
+    const chip = block.status === 'unchanged' ? '' : `<span class="chip ${block.status}">${L(`status_${block.status}`)}</span>`
+    const rows = block.rows.length
+      ? `<div class="d3-rows">${block.rows
+          .map(row => {
+            const clickable = row.name !== '(module)'
+            const classes = ['d3-row', row.planned ? 'planned' : 'extra', `kind-${row.kind}`]
+            if (expanded.has(row.key)) classes.push('open')
+            if (!clickable) classes.push('static')
+            const title = `${block.path} · ${row.name}${row.line ? `:${row.line}` : ''}`
+            return (
+              `<div class="${classes.join(' ')}" data-row="${escapeHtml(row.key)}" data-path="${escapeHtml(block.path)}" data-symbol="${escapeHtml(row.name)}" title="${escapeHtml(title)}">` +
+              `<span class="d3-kind">${KIND_SHORT[row.kind] || ''}</span><span class="d3-name">${escapeHtml(row.name)}</span>${clickable ? rowTail(row, block) : ''}</div>`
+            )
+          })
+          .join('')}</div>`
+      : `<div class="d3-note">${block.status === 'deleted' ? L('deletedShort') : L('noSymbolsShort')}</div>`
+    return (
+      `<div class="d3-block ${block.status}${block.extra ? ' extra' : ''}" style="${style}" data-block="${escapeHtml(block.id)}">${faces}` +
+      `<div class="d3-head" data-open="${escapeHtml(block.path)}" title="${escapeHtml(block.path)}"><span class="dot"></span><span class="d3-path"><span class="dir">${escapeHtml(dir)}</span>${escapeHtml(name)}</span>${chip}</div>` +
+      rows +
+      `</div>`
+    )
+  }
+
+  function renderScene() {
+    const current = graph()
+    if (!current) {
+      scene = null
+      sceneEl.innerHTML = ''
+      sceneEl.style.width = '0px'
+      sceneEl.style.height = '0px'
+      return
+    }
+    const previous = scene
+    scene = layoutScene(current, queries(), expanded)
+    // a lane that appears or goes changes the board's size: show it whole again
+    if (previous && (previous.width !== scene.width || previous.height !== scene.height)) fitPending = true
+    const defs =
+      `<defs>` +
+      Object.entries(MARKERS)
+        .map(([name, id]) => `<marker id="${id}" class="m-${name}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker>`)
+        .join('') +
+      `</defs>`
+    const edges = scene.edges
+      .map(
+        edge =>
+          `<path class="d3-edge ${edge.origin} ${edge.kind} ${edge.mode}" d="${pathD(edge)}" data-from="${escapeHtml(edge.from)}" data-to="${escapeHtml(edge.to)}" marker-end="url(#${markerOf(edge)})"></path>`,
+      )
+      .join('')
+    sceneEl.style.width = `${scene.width}px`
+    sceneEl.style.height = `${scene.height}px`
+    sceneEl.style.marginLeft = `${-scene.width / 2}px`
+    sceneEl.style.marginTop = `${-scene.height / 2}px`
+    sceneEl.innerHTML =
+      `<svg class="d3-edges" width="${scene.width}" height="${scene.height}" viewBox="0 0 ${scene.width} ${scene.height}" style="transform: translateZ(${DEPTH + 1}px)">${defs}${edges}</svg>` +
+      scene.blocks.map(renderBlock).join('')
+    if (fitPending) {
+      fitPending = false
+      fit()
+    } else {
+      applyView()
+    }
   }
 
   function render() {
-    layers.edges.innerHTML = canvas.edges
-      .map(edge => {
-        const geometry = edgePath(edge)
-        if (!geometry) return ''
-        const { x1, y1, x2, y2 } = geometry
-        const isSelected = selected && selected.type === 'edge' && selected.id === edge.id
-        const mx = (x1 + x2) / 2
-        const my = (y1 + y2) / 2
-        return (
-          `<g data-type="edge" data-id="${edge.id}">` +
-          `<line class="edge-hit" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"></line>` +
-          `<line class="edge${isSelected ? ' selected' : ''}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" marker-end="url(#pc-arrow)"></line>` +
-          (edge.label ? `<text class="edge-label" x="${mx}" y="${my - 8}" text-anchor="middle">${escapeHtml(edge.label)}</text>` : '') +
-          `</g>`
-        )
-      })
-      .join('')
-    layers.strokes.innerHTML = canvas.strokes
-      .map(stroke => {
-        const isSelected = selected && selected.type === 'stroke' && selected.id === stroke.id
-        return `<polyline data-type="stroke" data-id="${stroke.id}" class="stroke${isSelected ? ' selected' : ''}" points="${stroke.points.map(point => point.join(',')).join(' ')}"></polyline>`
-      })
-      .join('')
-    layers.nodes.innerHTML = canvas.nodes
-      .map(node => {
-        const isSelected = selected && selected.type === 'node' && selected.id === node.id
-        if (node.kind === 'text') {
-          return `<g data-type="node" data-id="${node.id}" class="label${isSelected ? ' selected' : ''}" transform="translate(${node.x},${node.y})"><rect x="-6" y="-20" width="${Math.max(40, (node.label || '').length * 8.6 + 12)}" height="28" fill="transparent"></rect><text x="0" y="0">${escapeHtml(node.label || '')}</text></g>`
-        }
-        const lines = wrapLabel(node.label, node.w)
-        const lineHeight = 18
-        const startY = node.h / 2 - ((lines.length - 1) * lineHeight) / 2 + 5
-        return (
-          `<g data-type="node" data-id="${node.id}" class="node${isSelected ? ' selected' : ''}" transform="translate(${node.x},${node.y})">` +
-          `<rect width="${node.w}" height="${node.h}"></rect>` +
-          `<text x="${node.w / 2}" y="${startY}" text-anchor="middle">${lines.map((line, index) => `<tspan x="${node.w / 2}" dy="${index === 0 ? 0 : lineHeight}">${escapeHtml(line)}</tspan>`).join('')}</text>` +
-          `</g>`
-        )
-      })
-      .join('')
+    renderToolbar()
+    renderEmpty()
+    renderScene()
   }
 
-  function renderGhost() {
-    if (!drag) {
-      layers.ghost.innerHTML = ''
-      return
-    }
-    if (drag.kind === 'arrow') {
-      const from = nodeById(drag.from)
-      if (!from) return
-      const [x1, y1] = anchor(from, drag.x, drag.y)
-      layers.ghost.innerHTML = `<line class="ghost" x1="${x1}" y1="${y1}" x2="${drag.x}" y2="${drag.y}"></line>`
-    } else if (drag.kind === 'pen') {
-      layers.ghost.innerHTML = `<polyline class="stroke" points="${drag.points.map(point => point.join(',')).join(' ')}"></polyline>`
+  function toggleRow(key, path, symbol) {
+    if (expanded.has(key)) {
+      expanded.delete(key)
     } else {
-      layers.ghost.innerHTML = ''
+      expanded.add(key)
+      const query = queries()[key]
+      if (!query || query.status === 'failed') onCallers(path, symbol)
     }
-  }
-
-  function changed() {
-    known = JSON.stringify(canvas)
     render()
-    clearTimeout(timer)
-    timer = setTimeout(() => onChange(clone(canvas)), 400)
   }
 
-  function toPoint(event) {
-    const point = svg.createSVGPoint()
-    point.x = event.clientX
-    point.y = event.clientY
-    const matrix = svg.getScreenCTM()
-    if (!matrix) return { x: 0, y: 0 }
-    const local = point.matrixTransform(matrix.inverse())
-    return { x: Math.round(local.x), y: Math.round(local.y) }
-  }
-
-  function hit(event) {
-    const element = event.target.closest('[data-type]')
-    return element ? { type: element.dataset.type, id: element.dataset.id } : null
-  }
-
-  function remove(target) {
-    if (!target) return
-    if (target.type === 'node') {
-      canvas.nodes = canvas.nodes.filter(node => node.id !== target.id)
-      canvas.edges = canvas.edges.filter(edge => edge.from !== target.id && edge.to !== target.id)
-    } else if (target.type === 'edge') {
-      canvas.edges = canvas.edges.filter(edge => edge.id !== target.id)
-    } else if (target.type === 'stroke') {
-      canvas.strokes = canvas.strokes.filter(stroke => stroke.id !== target.id)
-    }
-    if (selected && selected.id === target.id) selected = null
-    changed()
-  }
-
-  function closeEditor(save) {
-    if (!editor) return
-    const { input, apply } = editor
-    editor = null
-    if (save) apply(input.value.trim())
-    input.remove()
-  }
-
-  function editLabel(target) {
-    closeEditor(false)
-    let current = ''
-    let apply
-    let rect
-    if (target.type === 'node') {
-      const node = nodeById(target.id)
-      if (!node) return
-      current = node.label || ''
-      apply = value => {
-        node.label = value
-        changed()
-      }
-      rect = svg.querySelector(`[data-id="${node.id}"] rect`)?.getBoundingClientRect()
-    } else if (target.type === 'edge') {
-      const edge = canvas.edges.find(one => one.id === target.id)
-      if (!edge) return
-      current = edge.label || ''
-      apply = value => {
-        edge.label = value
-        changed()
-      }
-      rect = svg.querySelector(`[data-id="${edge.id}"] .edge`)?.getBoundingClientRect()
-    } else {
-      return
-    }
-    const wrapRect = wrap.getBoundingClientRect()
-    const input = document.createElement('input')
-    input.className = 'label-editor'
-    input.value = current
-    input.placeholder = t(language, target.type === 'edge' ? 'edgeLabel' : 'rename')
-    const left = rect ? rect.left - wrapRect.left : 20
-    const top = rect ? rect.top - wrapRect.top + (target.type === 'edge' ? rect.height / 2 - 14 : rect.height / 2 - 14) : 20
-    input.style.left = `${Math.max(4, left)}px`
-    input.style.top = `${Math.max(4, top)}px`
-    input.style.width = `${Math.max(120, rect ? rect.width : 160)}px`
-    wrap.appendChild(input)
-    editor = { input, apply }
-    input.focus()
-    input.select()
-    input.addEventListener('keydown', event => {
-      if (event.key === 'Enter') {
-        event.preventDefault()
-        closeEditor(true)
-      } else if (event.key === 'Escape') {
-        event.preventDefault()
-        closeEditor(false)
-      }
-    })
-    input.addEventListener('blur', () => closeEditor(true))
-  }
-
-  svg.addEventListener('pointerdown', event => {
-    if (event.button !== 0) return
-    if (editor) closeEditor(true)
-    const point = toPoint(event)
-    const target = hit(event)
-    svg.focus({ preventScroll: true })
-    if (tool === 'box') {
-      const node = { id: newId('n'), x: point.x - NODE_W / 2, y: point.y - NODE_H / 2, w: NODE_W, h: NODE_H, label: '' }
-      canvas.nodes.push(node)
-      selected = { type: 'node', id: node.id }
-      changed()
-      // The browser moves focus to the svg after this handler; open the editor after that.
-      setTimeout(() => editLabel(selected), 0)
-      return
-    }
-    if (tool === 'text') {
-      const node = { id: newId('t'), x: point.x, y: point.y, w: 0, h: 0, label: '', kind: 'text' }
-      canvas.nodes.push(node)
-      selected = { type: 'node', id: node.id }
-      changed()
-      setTimeout(() => editLabel(selected), 0)
-      return
-    }
-    if (tool === 'delete') {
-      remove(target)
-      return
-    }
-    if (tool === 'arrow') {
-      if (target && target.type === 'node') {
-        drag = { kind: 'arrow', from: target.id, x: point.x, y: point.y }
-        svg.setPointerCapture(event.pointerId)
-        renderGhost()
+  host.addEventListener('click', event => {
+    const command = event.target.closest('[data-d3]')
+    if (command) {
+      switch (command.dataset.d3) {
+        case 'generate':
+          expanded.clear()
+          onGenerate()
+          break
+        case 'flat':
+          view.flat = !view.flat
+          renderToolbar()
+          fit()
+          break
+        case 'fit':
+          fit()
+          break
+        case 'svg':
+          if (scene) onSaveSvg(toSvg())
+          break
+        default:
+          break
       }
       return
-    }
-    if (tool === 'pen') {
-      drag = { kind: 'pen', points: [[point.x, point.y]] }
-      svg.setPointerCapture(event.pointerId)
-      renderGhost()
-      return
-    }
-    // select
-    if (target && target.type === 'node') {
-      const node = nodeById(target.id)
-      selected = target
-      drag = { kind: 'move', id: node.id, dx: point.x - node.x, dy: point.y - node.y, moved: false }
-      svg.setPointerCapture(event.pointerId)
-      render()
-      return
-    }
-    selected = target
-    render()
-  })
-
-  svg.addEventListener('pointermove', event => {
-    if (!drag) return
-    const point = toPoint(event)
-    if (drag.kind === 'move') {
-      const node = nodeById(drag.id)
-      if (!node) return
-      node.x = point.x - drag.dx
-      node.y = point.y - drag.dy
-      drag.moved = true
-      render()
-    } else if (drag.kind === 'arrow') {
-      drag.x = point.x
-      drag.y = point.y
-      renderGhost()
-    } else if (drag.kind === 'pen') {
-      const last = drag.points[drag.points.length - 1]
-      if (Math.abs(last[0] - point.x) + Math.abs(last[1] - point.y) >= 3) {
-        drag.points.push([point.x, point.y])
-        renderGhost()
-      }
     }
   })
 
-  function finishDrag(event, point) {
+  // Rows and file names are tapped through the pointer events: the viewport
+  // captures the pointer for dragging, which would retarget a click to itself.
+  function tap(target) {
+    if (!target || !target.closest) return
+    const row = target.closest('.d3-row')
+    if (row && !row.classList.contains('static')) {
+      toggleRow(row.dataset.row, row.dataset.path, row.dataset.symbol)
+      return
+    }
+    const head = target.closest('[data-open]')
+    if (head && onOpenFile) onOpenFile(head.dataset.open)
+  }
+
+  host.addEventListener('mouseover', event => {
+    const row = event.target.closest('.d3-row')
+    for (const lit of sceneEl.querySelectorAll('.d3-edge.lit')) lit.classList.remove('lit')
+    if (!row) return
+    const key = row.dataset.row
+    for (const edge of sceneEl.querySelectorAll('.d3-edge')) {
+      if (edge.dataset.from === key || edge.dataset.to === key) edge.classList.add('lit')
+    }
+  })
+
+  viewport.addEventListener('pointerdown', event => {
+    if (event.button !== 0 && event.button !== 1) return
+    if (event.target.closest('button')) return
+    drag = {
+      x: event.clientX,
+      y: event.clientY,
+      spin: view.spin,
+      tilt: view.tilt,
+      panX: view.panX,
+      panY: view.panY,
+      moved: false,
+      pan: view.flat || event.shiftKey || event.button === 1,
+      target: event.button === 0 ? event.target : null,
+    }
+    viewport.setPointerCapture(event.pointerId)
+    viewport.classList.add('dragging')
+  })
+
+  viewport.addEventListener('pointermove', event => {
     if (!drag) return
-    const current = drag
+    const dx = event.clientX - drag.x
+    const dy = event.clientY - drag.y
+    if (!drag.moved && Math.abs(dx) + Math.abs(dy) < 4) return
+    drag.moved = true
+    if (drag.pan) {
+      view.panX = drag.panX + dx
+      view.panY = drag.panY + dy
+    } else {
+      view.spin = drag.spin + dx * 0.35
+      view.tilt = clamp(drag.tilt - dy * 0.25, 0, 80)
+    }
+    applyView()
+  })
+
+  const endDrag = tapped => {
+    if (!drag) return
+    const { moved, target } = drag
     drag = null
-    renderGhost()
-    if (current.kind === 'pen' && point) {
-      const last = current.points[current.points.length - 1]
-      if (last[0] !== point.x || last[1] !== point.y) current.points.push([point.x, point.y])
-    }
-    if (current.kind === 'move') {
-      if (current.moved) changed()
-      return
-    }
-    if (current.kind === 'arrow') {
-      const target = event ? hit(event) : null
-      if (target && target.type === 'node' && target.id !== current.from) {
-        const edge = { id: newId('e'), from: current.from, to: target.id }
-        canvas.edges.push(edge)
-        selected = { type: 'edge', id: edge.id }
-        changed()
-      }
-      return
-    }
-    if (current.kind === 'pen') {
-      if (current.points.length > 1) {
-        canvas.strokes.push({ id: newId('s'), points: current.points })
-        changed()
-      }
-    }
+    viewport.classList.remove('dragging')
+    if (tapped && !moved) tap(target)
   }
+  viewport.addEventListener('pointerup', () => endDrag(true))
+  viewport.addEventListener('pointercancel', () => endDrag(false))
 
-  svg.addEventListener('pointerup', event => {
-    // With pointer capture the target is the svg; find what is under the pointer.
-    const under = document.elementFromPoint(event.clientX, event.clientY)
-    finishDrag(under ? { target: under } : null, toPoint(event))
-  })
-  svg.addEventListener('pointercancel', () => finishDrag(null))
-
-  svg.addEventListener('dblclick', event => {
-    const target = hit(event)
-    if (target && (target.type === 'node' || target.type === 'edge')) editLabel(target)
-  })
-
-  svg.addEventListener('keydown', event => {
-    if (editor) return
-    if ((event.key === 'Delete' || event.key === 'Backspace') && selected) {
+  viewport.addEventListener(
+    'wheel',
+    event => {
+      if (!scene) return
       event.preventDefault()
-      remove(selected)
-    } else if (event.key === 'Escape') {
-      selected = null
-      render()
-    }
-  })
-
-  toolbar.addEventListener('click', event => {
-    const toolButton = event.target.closest('[data-tool]')
-    if (toolButton) {
-      tool = toolButton.dataset.tool
-      renderToolbar()
-      return
-    }
-    const command = event.target.closest('[data-diagram]')
-    if (!command) return
-    if (command.dataset.diagram === 'clear') {
-      canvas = empty()
-      selected = null
-      changed()
-    } else if (command.dataset.diagram === 'svg') {
-      onSaveSvg(toSvg())
-    }
-  })
+      view.zoom = clamp(view.zoom * Math.exp(-event.deltaY * 0.0015), 0.25, 3)
+      applyView()
+    },
+    { passive: false },
+  )
 
   function cssVar(name, fallback) {
     const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
     return value || fallback
   }
 
+  /** The scene flat, as a standalone SVG with the theme's colors. */
   function toSvg() {
-    const stroke = cssVar('--fg', '#222')
-    const nodeFill = cssVar('--accent-soft', '#e8ebff')
-    const nodeStroke = cssVar('--accent', '#5b6cff')
-    const penStroke = cssVar('--comment', '#7c3aed')
-    const bounds = { minX: WIDTH, minY: HEIGHT, maxX: 0, maxY: 0 }
-    const grow = (x, y) => {
-      bounds.minX = Math.min(bounds.minX, x)
-      bounds.minY = Math.min(bounds.minY, y)
-      bounds.maxX = Math.max(bounds.maxX, x)
-      bounds.maxY = Math.max(bounds.maxY, y)
+    const fg = cssVar('--fg', '#222')
+    const dim = cssVar('--fg-dim', '#777')
+    const accent = cssVar('--accent', '#5b6cff')
+    const border = cssVar('--border', '#ddd')
+    const elev = cssVar('--bg-elev', '#fff')
+    const colors = {
+      new: [cssVar('--new', '#1f9d55'), cssVar('--new-soft', '#e3f6ea')],
+      modified: [cssVar('--mod', '#d9850b'), cssVar('--mod-soft', '#fff1dc')],
+      deleted: [cssVar('--del', '#d64545'), cssVar('--del-soft', '#fde6e6')],
+      unchanged: [cssVar('--mixed', '#6b7085'), cssVar('--mixed-soft', '#eceef4')],
     }
-    for (const node of canvas.nodes) {
-      grow(node.x - 10, node.y - 24)
-      grow(node.x + Math.max(node.w, (node.label || '').length * 8.6) + 10, node.y + node.h + 10)
-    }
-    for (const stroke of canvas.strokes) for (const [x, y] of stroke.points) grow(x - 5, y - 5), grow(x + 5, y + 5)
-    if (bounds.maxX <= bounds.minX) Object.assign(bounds, { minX: 0, minY: 0, maxX: WIDTH, maxY: HEIGHT })
     const parts = []
-    parts.push(`<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="${stroke}"/></marker></defs>`)
-    for (const edge of canvas.edges) {
-      const geometry = edgePath(edge)
-      if (!geometry) continue
-      const { x1, y1, x2, y2 } = geometry
-      parts.push(`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${stroke}" stroke-width="2" marker-end="url(#arrow)"/>`)
-      if (edge.label) parts.push(`<text x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 8}" text-anchor="middle" font-family="sans-serif" font-size="13" fill="${stroke}">${escapeHtml(edge.label)}</text>`)
+    parts.push(
+      `<defs>` +
+        `<marker id="a-plan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="${fg}"/></marker>` +
+        `<marker id="a-use" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="${dim}"/></marker>` +
+        `<marker id="a-callers" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="${accent}"/></marker>` +
+        `</defs>`,
+    )
+    for (const edge of scene.edges) {
+      const callers = edge.origin !== 'plan'
+      const stroke = callers ? accent : edge.kind === 'use' ? dim : fg
+      const dash = edge.origin === 'others' ? ' stroke-dasharray="3 4"' : edge.kind === 'use' ? ' stroke-dasharray="5 4"' : ''
+      parts.push(`<path d="${pathD(edge)}" fill="none" stroke="${stroke}" stroke-width="1.8"${dash} marker-end="url(#a-${callers ? 'callers' : edge.kind === 'use' ? 'use' : 'plan'})"/>`)
     }
-    for (const line of canvas.strokes) parts.push(`<polyline points="${line.points.map(point => point.join(',')).join(' ')}" fill="none" stroke="${penStroke}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>`)
-    for (const node of canvas.nodes) {
-      if (node.kind === 'text') {
-        parts.push(`<text x="${node.x}" y="${node.y}" font-family="sans-serif" font-size="15" fill="${stroke}">${escapeHtml(node.label || '')}</text>`)
+    for (const block of scene.blocks) {
+      const [line, soft] = colors[block.status] || colors.unchanged
+      const dashed = block.extra ? ' stroke-dasharray="6 4"' : ''
+      parts.push(`<rect x="${block.x}" y="${block.y}" width="${block.w}" height="${block.h}" rx="8" fill="${elev}" stroke="${line}" stroke-width="1.5"${dashed}/>`)
+      parts.push(`<rect x="${block.x}" y="${block.y}" width="${block.w}" height="${HEAD_H}" rx="8" fill="${soft}"/>`)
+      if (block.h > HEAD_H) parts.push(`<line x1="${block.x}" y1="${block.y + HEAD_H}" x2="${block.x + block.w}" y2="${block.y + HEAD_H}" stroke="${border}"/>`)
+      const label = block.kind === 'others' ? `⋯ ${L('callersOthers', { n: block.count })}` : block.path
+      parts.push(`<text x="${block.x + 10}" y="${block.y + HEAD_H / 2 + 4}" font-family="monospace" font-size="11.5" font-weight="600" fill="${line}">${escapeHtml(label)}</text>`)
+      if (block.kind === 'others') continue
+      if (!block.rows.length) {
+        parts.push(`<text x="${block.x + 10}" y="${block.y + HEAD_H + 17}" font-family="sans-serif" font-size="11" font-style="italic" fill="${dim}">${escapeHtml(block.status === 'deleted' ? L('deletedShort') : L('noSymbolsShort'))}</text>`)
         continue
       }
-      parts.push(`<rect x="${node.x}" y="${node.y}" width="${node.w}" height="${node.h}" rx="10" fill="${nodeFill}" stroke="${nodeStroke}" stroke-width="1.5"/>`)
-      const lines = wrapLabel(node.label, node.w)
-      const startY = node.y + node.h / 2 - ((lines.length - 1) * 18) / 2 + 5
-      parts.push(`<text x="${node.x + node.w / 2}" y="${startY}" text-anchor="middle" font-family="sans-serif" font-size="15" fill="${stroke}">${lines.map((line, index) => `<tspan x="${node.x + node.w / 2}" dy="${index === 0 ? 0 : 18}">${escapeHtml(line)}</tspan>`).join('')}</text>`)
+      block.rows.forEach((row, index) => {
+        const y = block.y + HEAD_H + PAD + index * ROW_H + ROW_H / 2 + 4
+        parts.push(`<text x="${block.x + 10}" y="${y}" font-family="monospace" font-size="10" fill="${dim}">${escapeHtml(KIND_SHORT[row.kind] || '')}</text>`)
+        parts.push(`<text x="${block.x + 44}" y="${y}" font-family="monospace" font-size="12" fill="${row.planned ? fg : dim}">${escapeHtml(row.name)}</text>`)
+      })
     }
-    const width = Math.ceil(bounds.maxX - bounds.minX)
-    const height = Math.ceil(bounds.maxY - bounds.minY)
-    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${bounds.minX} ${bounds.minY} ${width} ${height}" width="${width}" height="${height}"><rect x="${bounds.minX}" y="${bounds.minY}" width="${width}" height="${height}" fill="white"/>${parts.join('')}</svg>`
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${scene.width} ${scene.height}" width="${scene.width}" height="${scene.height}"><rect width="${scene.width}" height="${scene.height}" fill="${elev}"/>${parts.join('')}</svg>`
   }
 
-  renderToolbar()
+  applyView()
   render()
 
   return {
     element: host,
-    isBusy: () => drag !== null || editor !== null,
+    isBusy: () => drag !== null,
     setLang(next) {
+      if (language === next) return
       language = next
-      renderToolbar()
-    },
-    setCanvas(next) {
-      const incoming = JSON.stringify(next || empty())
-      if (incoming === known) return
-      if (drag || editor) return
-      canvas = next ? clone(next) : empty()
-      known = incoming
-      selected = null
       render()
     },
-    flush() {
-      if (timer) {
-        clearTimeout(timer)
-        timer = null
-        onChange(clone(canvas))
+    setData(next) {
+      const diagram = next.diagram || { status: 'idle', callers: {} }
+      const incoming = JSON.stringify([diagram, next.review ? next.review.version : 0, Boolean(next.plan)])
+      const hadGraph = data.diagram && data.diagram.status === 'ready' ? data.diagram.graph : null
+      data = { plan: next.plan, diagram, review: next.review || { version: 0 } }
+      if (incoming === known) return
+      known = incoming
+      if (diagram.status === 'ready' && diagram.graph !== hadGraph && JSON.stringify(diagram.graph) !== JSON.stringify(hadGraph)) {
+        expanded.clear()
+        fitPending = true
       }
+      render()
     },
+    fit,
   }
 }

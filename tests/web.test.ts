@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { buildSnapshot, fileEntries, parseAction, parseCanvas, parseServerLine, splitLines } from '../hooks/web'
+import { WEB_PROTOCOL, buildSnapshot, fileEntries, parseAction, parseServerLine, splitLines } from '../hooks/web'
 import { parsePlan } from '../hooks/plan-parser'
 import { DEMO_PLAN } from '../hooks/demo-plan'
 
@@ -27,31 +27,13 @@ describe('web bridge helpers', () => {
     expect(parseAction({ type: 'askMore', id: 'q1', question: ' ' })).toBe(null)
     expect(parseAction({ type: 'askMore', question: 'x' })).toBe(null)
     expect(parseAction({ type: 'setLang', lang: 'fr' })).toEqual({ type: 'setLang', lang: 'en' })
-    expect(parseAction({ type: 'canvasSvg', svg: 'nope' })).toBe(null)
+    expect(parseAction({ type: 'diagramSvg', svg: 'nope' })).toBe(null)
+    expect(parseAction({ type: 'diagramSvg', svg: ' <svg/>' })).toEqual({ type: 'diagramSvg', svg: ' <svg/>' })
+    expect(parseAction({ type: 'generateDiagram' })).toEqual({ type: 'generateDiagram' })
+    expect(parseAction({ type: 'callers', path: 'a.ts', symbol: 'f' })).toEqual({ type: 'callers', path: 'a.ts', symbol: 'f' })
+    expect(parseAction({ type: 'callers', path: 'a.ts' })).toBe(null)
     expect(parseAction({ type: 'explode' })).toBe(null)
     expect(parseAction('submit')).toBe(null)
-  })
-
-  test('keeps only well-formed canvas items and drops edges to unknown nodes', async () => {
-    const canvas = parseCanvas({
-      nodes: [
-        { id: 'a', x: 1, y: 2, w: 10, h: 5, label: 'A' },
-        { id: 't', x: 1, y: 2, w: 0, h: 0, label: 'note', kind: 'text' },
-        { id: 'bad', x: 'no' },
-      ],
-      edges: [
-        { id: 'e1', from: 'a', to: 't', label: 'uses' },
-        { id: 'e2', from: 'a', to: 'ghost' },
-      ],
-      strokes: [
-        { id: 's1', points: [[0, 0], [1, 1], ['x', 2]] },
-        { id: 's2', points: [[0, 0]] },
-      ],
-    })
-    expect(canvas?.nodes.length).toBe(2)
-    expect(canvas?.nodes[1]?.kind).toBe('text')
-    expect(canvas?.edges).toEqual([{ id: 'e1', from: 'a', to: 't', label: 'uses' }])
-    expect(canvas?.strokes).toEqual([{ id: 's1', points: [[0, 0], [1, 1]] }])
   })
 
   test('splits the server stream into lines and reads its messages', async () => {
@@ -83,7 +65,7 @@ describe('web bridge helpers', () => {
       comments: [],
       bodies: {},
       qa: [],
-      canvas: { nodes: [], edges: [], strokes: [] },
+      diagram: { status: 'idle', callers: {} },
       files: {},
       lang: 'uk',
       summaryLimit: 9000,
@@ -91,7 +73,9 @@ describe('web bridge helpers', () => {
       nowMs: 0,
     })
     expect(snapshot.lang).toBe('uk')
+    expect(snapshot.diagram.status).toBe('idle')
     expect(snapshot.generatedAt).toBe('1970-01-01T00:00:00.000Z')
+    expect(snapshot.protocol).toBe(WEB_PROTOCOL)
     expect(Object.keys(snapshot.files).length).toBe(parsed.plan.files.length)
   })
 })

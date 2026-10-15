@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import { DEMO_PLAN } from '../hooks/demo-plan'
 import { insertionIndex, newFileStub, stubDiff } from '../hooks/diff'
 import { findBlock, parsePlan, planFromMarkdown, stripBlocks } from '../hooks/plan-parser'
-import { canvasText, revisionPrompt } from '../hooks/prompts'
+import { revisionPrompt } from '../hooks/prompts'
 import { renderRecord } from '../hooks/record'
 import { allDirKeys, buildTree, visibleRows } from '../hooks/tree'
 
@@ -113,27 +113,29 @@ describe('prompts and record', () => {
       { id: '2', target: { path: 'src/auth/' }, text: 'Rename the folder to sessions.', createdInVersion: 1 },
       { id: '3', target: { path: 'src/auth/session.ts', symbol: 'refreshSession' }, text: 'Return a Result type.', createdInVersion: 1 },
     ]
-    const canvas = {
-      nodes: [
-        { id: 'a', x: 0, y: 0, w: 10, h: 3, label: 'Client' },
-        { id: 'b', x: 20, y: 0, w: 10, h: 3, label: 'Auth API' },
-      ],
-      edges: [{ id: 'e', from: 'a', to: 'b', label: 'refresh' }],
-      strokes: [],
-    }
-    const prompt = revisionPrompt(parsed.plan, comments, canvas, 1)
+    const prompt = revisionPrompt(parsed.plan, comments, 1)
     expect(prompt).toContain('plan version 1')
     expect(prompt).toContain('Comments on the whole plan:\n- Keep it smaller.')
     expect(prompt).toContain('- src/auth/ (folder)')
     expect(prompt).toContain('[symbol refreshSession] Return a Result type.')
-    expect(canvasText(canvas)).toContain('- Client -> Auth API: refresh')
+    const diagram = {
+      status: 'ready' as const,
+      version: 1,
+      callers: {},
+      graph: {
+        files: [{ path: 'src/auth/session.ts', status: 'new' as const, symbols: [{ name: 'refreshSession', kind: 'function' as const }] }],
+        edges: [{ from: { path: 'src/auth/user.ts', symbol: 'getCurrentUser' }, to: { path: 'src/auth/session.ts', symbol: 'refreshSession' }, kind: 'call' as const }],
+      },
+    }
     const record = renderRecord({
       plan: parsed.plan,
       review: { status: 'reviewing', version: 1, parsedFrom: 'block', warnings: [], history: ['v1 received'], previousPaths: [] },
       comments,
-      canvas,
+      diagram,
       nowMs: 0,
     })
+    expect(record).toContain('## Diagram')
+    expect(record).toContain('- src/auth/user.ts#getCurrentUser -> src/auth/session.ts#refreshSession')
     expect(record).toContain('# Session refresh for the auth module')
     expect(record).toContain('## Task')
     expect(record).toContain('AUTH-42')

@@ -1,0 +1,90 @@
+{
+  "graph": {
+    "files": [
+      {
+        "path": "src/auth/session.ts",
+        "status": "new",
+        "symbols": [
+          { "name": "Session", "kind": "type" },
+          { "name": "refreshSession", "kind": "function" },
+          { "name": "isExpiringSoon", "kind": "function" }
+        ]
+      },
+      { "path": "src/auth/user.ts", "status": "modified", "symbols": [{ "name": "getCurrentUser", "kind": "function" }] },
+      { "path": "src/api/routes.ts", "status": "modified", "symbols": [{ "name": "refreshRoute", "kind": "const" }] },
+      {
+        "path": "src/legacy/tokens.ts",
+        "status": "deleted",
+        "symbols": [
+          { "name": "StoredTokens", "kind": "type" },
+          { "name": "saveTokens", "kind": "function" },
+          { "name": "loadTokens", "kind": "function" },
+          { "name": "clearTokens", "kind": "function" }
+        ]
+      },
+      { "path": "docs/auth.md", "status": "new", "symbols": [] }
+    ],
+    "edges": [
+      { "from": { "path": "src/auth/user.ts", "symbol": "getCurrentUser" }, "to": { "path": "src/auth/session.ts", "symbol": "refreshSession" }, "kind": "call" },
+      { "from": { "path": "src/auth/user.ts", "symbol": "getCurrentUser" }, "to": { "path": "src/auth/session.ts", "symbol": "isExpiringSoon" }, "kind": "call" },
+      { "from": { "path": "src/auth/session.ts", "symbol": "refreshSession" }, "to": { "path": "src/auth/session.ts", "symbol": "Session" }, "kind": "use" },
+      { "from": { "path": "src/auth/session.ts", "symbol": "isExpiringSoon" }, "to": { "path": "src/auth/session.ts", "symbol": "Session" }, "kind": "use" },
+      { "from": { "path": "src/legacy/tokens.ts", "symbol": "saveTokens" }, "to": { "path": "src/legacy/tokens.ts", "symbol": "StoredTokens" }, "kind": "use" },
+      { "from": { "path": "src/legacy/tokens.ts", "symbol": "loadTokens" }, "to": { "path": "src/legacy/tokens.ts", "symbol": "StoredTokens" }, "kind": "use" }
+    ]
+  },
+  "callers": {
+    "src/auth/session.ts#refreshSession": {
+      "callers": [
+        { "path": "src/auth/user.ts", "symbol": "getCurrentUser", "kind": "function", "line": 21 },
+        { "path": "src/api/handlers.ts", "symbol": "handleRefresh", "kind": "function", "line": 14 },
+        { "path": "src/auth/middleware.ts", "symbol": "requireSession", "kind": "function", "line": 22 }
+      ],
+      "more": 0
+    },
+    "src/auth/session.ts#isExpiringSoon": {
+      "callers": [
+        { "path": "src/auth/user.ts", "symbol": "getCurrentUser", "kind": "function", "line": 19 },
+        { "path": "src/auth/middleware.ts", "symbol": "requireSession", "kind": "function", "line": 20 }
+      ],
+      "more": 0
+    },
+    "src/auth/session.ts#Session": {
+      "callers": [
+        { "path": "src/auth/user.ts", "symbol": "getCurrentUser", "kind": "function", "line": 18 },
+        { "path": "src/auth/storage.ts", "symbol": "readSession", "kind": "function", "line": 6 }
+      ],
+      "more": 0
+    },
+    "src/auth/user.ts#getCurrentUser": {
+      "callers": [
+        { "path": "src/api/handlers.ts", "symbol": "handleMe", "kind": "function", "line": 40 },
+        { "path": "src/ui/Header.tsx", "symbol": "Header", "kind": "function", "line": 12 },
+        { "path": "src/ui/Profile.tsx", "symbol": "Profile", "kind": "function", "line": 19 },
+        { "path": "src/ui/Profile.tsx", "symbol": "ProfileMenu", "kind": "function", "line": 44 }
+      ],
+      "more": 23
+    },
+    "src/api/routes.ts#refreshRoute": {
+      "callers": [{ "path": "src/api/routes.ts", "symbol": "routes", "kind": "const", "line": 11 }],
+      "more": 0
+    },
+    "src/legacy/tokens.ts#loadTokens": {
+      "callers": [
+        { "path": "src/auth/storage.ts", "symbol": "readSession", "kind": "function", "line": 9 },
+        { "path": "src/app/bootstrap.ts", "symbol": "(module)", "kind": "other", "line": 3 },
+        { "path": "src/auth/handlers.ts", "symbol": "handleLogin", "kind": "function", "line": 31 }
+      ],
+      "more": 2
+    },
+    "src/legacy/tokens.ts#saveTokens": {
+      "callers": [{ "path": "src/auth/handlers.ts", "symbol": "handleLogin", "kind": "function", "line": 28 }],
+      "more": 0
+    },
+    "src/legacy/tokens.ts#clearTokens": {
+      "callers": [{ "path": "src/auth/handlers.ts", "symbol": "handleLogout", "kind": "function", "line": 52 }],
+      "more": 0
+    },
+    "src/legacy/tokens.ts#StoredTokens": { "callers": [], "more": 0 }
+  }
+}

@@ -129,3 +129,49 @@ test('codeview: source and diff lines carry numbers, and the inline body replace
   assert.match(preview, /class="line gen" data-line="1"/)
   assert.match(preview, /class="line" data-line="4"/)
 })
+
+test('diagram layout: callees sit right of callers, callers of an opened symbol join the planned blocks or a lane, others get a block', async () => {
+  const { layoutScene, pathD, layerFiles, rowKey, BLOCK_W } = await import('../web/diagram-layout.js')
+  const { readFileSync } = await import('node:fs')
+  const demo = JSON.parse(readFileSync(new URL('../fixtures/demo-diagram.json', import.meta.url), 'utf8'))
+  const layers = layerFiles(['a', 'b', 'c', 'd'], [{ from: 'a', to: 'b' }, { from: 'b', to: 'c' }, { from: 'c', to: 'a' }])
+  assert.deepEqual([...layers.entries()], [['a', 0], ['b', 1], ['c', 2], ['d', 0]])
+
+  const plain = layoutScene(demo.graph, {}, new Set())
+  const byPath = new Map(plain.blocks.map(block => [block.path, block]))
+  assert.equal(plain.blocks.length, demo.graph.files.length)
+  assert.ok(byPath.get('src/auth/user.ts').x < byPath.get('src/auth/session.ts').x, 'the caller file is left of the callee file')
+  assert.equal(byPath.get('src/auth/session.ts').rows.map(row => row.name).join(','), 'Session,refreshSession,isExpiringSoon')
+  assert.equal(byPath.get('docs/auth.md').rows.length, 0)
+  assert.equal(plain.edges.length, demo.graph.edges.length)
+  const inside = plain.edges.find(edge => edge.from === rowKey('src/auth/session.ts', 'refreshSession'))
+  assert.equal(inside.mode, 'inside')
+  assert.match(pathD(inside), /^M \d+(\.\d+)? \d+(\.\d+)? C /)
+  const forward = plain.edges.find(edge => edge.to === rowKey('src/auth/session.ts', 'refreshSession') && edge.mode === 'forward')
+  assert.equal(forward.x1, byPath.get('src/auth/user.ts').x + BLOCK_W)
+  assert.equal(forward.x2, byPath.get('src/auth/session.ts').x)
+
+  const key = rowKey('src/auth/user.ts', 'getCurrentUser')
+  const routeKey = rowKey('src/api/routes.ts', 'refreshRoute')
+  const callers = {
+    [key]: { status: 'ready', ...demo.callers[key] },
+    [routeKey]: { status: 'ready', ...demo.callers[routeKey] },
+    [rowKey('src/auth/session.ts', 'Session')]: { status: 'loading', callers: [], more: 0 },
+  }
+  const opened = layoutScene(demo.graph, callers, new Set([key, routeKey, rowKey('src/auth/session.ts', 'Session')]))
+  const paths = new Map(opened.blocks.map(block => [block.path || block.id, block]))
+  assert.equal(opened.blocks.filter(block => !block.extra).length, demo.graph.files.length, 'the planned blocks are all still there')
+  assert.ok(paths.get('src/ui/Header.tsx').extra)
+  assert.equal(paths.get('src/ui/Header.tsx').status, 'unchanged')
+  assert.ok(paths.get('src/ui/Header.tsx').x < paths.get('src/auth/user.ts').x, 'a caller block is left of the callee block')
+  assert.equal(paths.get('src/ui/Profile.tsx').rows.map(row => row.name).join(','), 'Profile,ProfileMenu')
+  const routes = paths.get('src/api/routes.ts')
+  assert.deepEqual(routes.rows.map(row => [row.name, row.planned]), [['refreshRoute', true], ['routes', false]])
+  assert.equal(opened.edges.find(edge => edge.from === rowKey('src/api/routes.ts', 'routes')).mode, 'inside')
+  const others = paths.get(`others:${key}`)
+  assert.equal(others.kind, 'others')
+  assert.equal(others.count, 23)
+  assert.equal(opened.edges.find(edge => edge.from === others.id).origin, 'others')
+  assert.equal(opened.blocks.filter(block => block.id.startsWith('others:')).length, 1, 'a loading query adds nothing yet')
+  assert.ok(opened.width > plain.width, 'the lane widens the scene')
+})

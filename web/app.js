@@ -58,6 +58,19 @@ let popupState = null
 const L = (key, params) => t(lang, key, params)
 const bodyKey = (path, symbol) => `${path}#${symbol}`
 const newId = () => Math.random().toString(36).slice(2, 10)
+/** An id no thread holds yet, so the mod keeps it and the popup can follow its thread. */
+function freshId() {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const id = newId()
+    if (!state || !state.qa.some(one => one.id === id)) return id
+  }
+  return newId()
+}
+// The state shape and the actions this page expects; hooks/web.ts carries the
+// same number. A session keeps the mod it started with, while this file comes
+// from disk, so an older mod behind a newer page gets a warning.
+const PROTOCOL = 3
+const staleMod = () => Boolean(state && state.plan && state.protocol !== PROTOCOL)
 
 // ---------- question threads ----------
 
@@ -224,6 +237,7 @@ function renderBanner() {
   const { plan, review } = state
   const banners = []
   if (!ui.online) banners.push(`<div class="banner warn"><span class="spinner"></span>${L('offline')}</div>`)
+  if (staleMod()) banners.push(`<div class="banner warn">⚠ ${L('staleMod')}</div>`)
   if (!plan) banners.push(`<div class="banner">${L('noPlan')}</div>`)
   else if (review.status === 'revising') banners.push(`<div class="banner revising"><span class="spinner"></span>${L('revisingNote')}</div>`)
   else if (review.status === 'approved') banners.push(`<div class="banner approved">${L('approvedNote')}</div>`)
@@ -439,22 +453,27 @@ function renderComments() {
   return `<section class="card">${state.comments.length ? section('pending', groups.pending) + section('sent', groups.sent) + section('resolved', groups.resolved) : `<div class="hint">${L('noComments')}</div>`}${history}</section>`
 }
 
+// The diagram keeps its own element across redraws: its view (rotation, zoom,
+// opened symbols) lives in the module, the data comes from the state.
 function ensureDiagram() {
   if (!diagramHost) {
     diagramHost = document.createElement('section')
     diagramHost.className = 'card diagram-card'
     diagram = mountDiagram(diagramHost, {
       lang,
-      initial: state.canvas,
-      onChange: canvas => run({ type: 'canvas', canvas }),
-      onSaveSvg: svg => run({ type: 'canvasSvg', svg }),
+      onGenerate: () => run({ type: 'generateDiagram' }),
+      onCallers: (path, symbol) => run({ type: 'callers', path, symbol }),
+      onOpenFile: path => {
+        if (state.plan && state.plan.files.some(one => one.path === path)) selectFile(path)
+      },
+      onSaveSvg: svg => run({ type: 'diagramSvg', svg }),
     })
-  } else {
-    diagram.setLang(lang)
-    diagram.setCanvas(state.canvas)
   }
+  // Attach first: the fit of the view measures the viewport, which has no size while detached.
   const slot = document.getElementById('diagram-slot')
   if (slot && diagramHost.parentElement !== slot) slot.appendChild(diagramHost)
+  diagram.setLang(lang)
+  diagram.setData({ plan: state.plan, diagram: state.diagram, review: state.review })
 }
 
 function render() {
@@ -569,8 +588,22 @@ function openPopup({ title, target, selection, prefill, at, mode = 'comment' }) 
 }
 
 function popupThread() {
-  if (!popupState || !popupState.qaId || !state) return null
-  return state.qa.find(one => one.id === popupState.qaId) || null
+  if (!popupState || !state) return null
+  if (popupState.qaId) {
+    const own = state.qa.find(one => one.id === popupState.qaId)
+    if (own) return own
+  }
+  // A mod older than this page names the thread itself and ignores the id
+  // the popup chose: adopt the newest thread that asks the popup's question.
+  const { pending } = popupState
+  if (pending && pending.turns === 0) {
+    const adopted = [...state.qa].reverse().find(one => one.question === pending.question)
+    if (adopted) {
+      popupState.qaId = adopted.id
+      return adopted
+    }
+  }
+  return null
 }
 
 /** The question the popup is waiting for, until the state shows it. */
@@ -676,12 +709,14 @@ function sendPopupQuestion() {
   if (!question) return
   const item = popupThread()
   if (popupPending() || (item && threadBusy(item))) return
+  // A mod older than this page drops a follow-up without a word: say so and keep the draft.
+  if (item && staleMod()) return toast(L('staleMod'))
   textarea.value = ''
   if (item) {
     popupState.pending = { question, turns: qaTurns(item).length }
     void run({ type: 'askMore', id: item.id, question })
   } else {
-    const id = newId()
+    const id = freshId()
     popupState.qaId = id
     popupState.pending = { question, turns: 0 }
     const target = popupTarget()
@@ -696,8 +731,11 @@ function threadToComment() {
   if (!item) return
   popupState.mode = 'comment'
   popupState.prefill = threadTextOf(item)
-  popupState.target = qaTarget(item)
-  if (item.target && item.target.selection) popupState.selection = item.target.selection
+  // The thread's own target wins; a thread without one keeps the popup's selection.
+  if (item.target && Object.keys(item.target).length) {
+    popupState.target = qaTarget(item)
+    if (item.target.selection) popupState.selection = item.target.selection
+  }
   renderPopup({ focus: true, keepDraft: false })
 }
 
@@ -828,7 +866,7 @@ function submitQuestion() {
   const question = input.value.trim()
   if (!question) return
   input.value = ''
-  run({ type: 'ask', id: newId(), question, ...(ui.selected ? { focus: ui.selected } : {}) })
+  run({ type: 'ask', id: freshId(), question, ...(ui.selected ? { focus: ui.selected } : {}) })
 }
 
 function sendReply(id) {
@@ -837,6 +875,8 @@ function sendReply(id) {
   if (!input || !item || threadBusy(item)) return
   const question = input.value.trim()
   if (!question) return
+  // A mod older than this page drops a follow-up without a word: say so and keep the draft.
+  if (staleMod()) return toast(L('staleMod'))
   input.value = ''
   run({ type: 'askMore', id, question })
 }

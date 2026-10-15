@@ -1,6 +1,6 @@
 # Plan Crutches
 
-Plan Crutches is a mod for Claude Code. It shows Claude's plan in a review page in your browser before Claude writes any code. You see the task, a short summary, the change tree, the signatures of new and changed methods and a diff against the current files. You comment on folders, files, symbols or any text you select with the mouse, you draw the architecture, and you press Submit. With comments, Claude revises the plan and the page shows the next version. Without comments, Claude proceeds to implementation.
+Plan Crutches is a mod for Claude Code. It shows Claude's plan in a review page in your browser before Claude writes any code. You see the task, a short summary, the change tree, the signatures of new and changed methods and a diff against the current files. You comment on folders, files, symbols or any text you select with the mouse. A 3D diagram shows the files and the calls the plan changes. Then you press Submit. With comments, Claude revises the plan and the page shows the next version. Without comments, Claude proceeds to implementation.
 
 ## How it works
 
@@ -21,7 +21,7 @@ The page is plain HTML, CSS and JavaScript under `web/`, served by a small Node 
 - Changes by folder: every folder and file the plan touches, marked `new`, `mod` or `del`, with the number of comments on each. Click a folder to fold it, click the speech bubble to comment on it, click a file to open it.
 - File view: the description of the change and each symbol with its highlighted signature. Below them, a diff of the signatures against the current file and the full file on demand. An Expand implementation button asks the model for a body. In the diff and in the preview of a new file, every planned signature carries a Show implementation button. The generated code takes the place of the stub right there, and you can comment on its lines.
 - Select any text with the mouse, in a code block, the summary, the task or an answer: a popup opens next to the selection with two tabs. Comment: type the comment and press Enter. A code comment keeps the line range and the selected text, and the lines stay marked. Ask: type a question about the selected text and press Enter. Claude answers in the same window, with the selection and its place as context, and you continue the conversation there. The thread is kept in the Ask tab, and "Add the conversation to a comment" turns it into a comment on the same lines.
-- Diagram: boxes, arrows, free strokes and text labels on an SVG canvas. The drawing is saved with the review, described to Claude on Submit, and Save as SVG writes it next to the Markdown record.
+- Diagram: a 3D board with one block per planned file, colored by its status: new, modified or deleted. Each block lists the symbols the plan changes. Lines between symbols are the calls and uses the plan creates. Calls inside one file are drawn inside its block. Press Generate change diagram to build it: a clean session with read-only tools gets the plan and reads the project. Click a symbol to see every place in the project that calls it, in existing code too. The callers arrive as new rows and blocks, up to 20. More callers than that become one block marked others. Click the symbol again to hide them. The plan's own blocks are always drawn whole. Drag rotates the board, Shift and drag pans it, the wheel zooms, and 2D flattens it. Save as SVG writes the flat diagram next to the Markdown record.
 - Ask: a question box that answers from the plan and the session without changing either. Every question is a thread: Reply continues the conversation under it, with the earlier turns as context. A thread shows where it came from and the selected text, and can become a comment. Answered threads go into the Markdown record.
 - Comments: every comment by state (pending, sent, resolved) and the review history.
 
@@ -49,7 +49,7 @@ Set them in `/config` or in `settings.json` under `pluginConfigs.plan-crutches.o
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `language` | `en` | Page and pane language, `en` or `uk`. |
-| `model` | `sonnet` | Model for the light calls: plan structure extraction, the pick of project files for an implementation, and answers without a session fork. |
+| `model` | `sonnet` | Model for the light calls: plan structure extraction, the pick of project files for an implementation, the change diagram and its callers, and answers without a session fork. |
 | `bodyModel` | `opus` | Model that writes method bodies. Empty means the `model` option. |
 | `plansDir` | `docs/plans` | Folder, relative to the project, for the Markdown records and SVG files. |
 | `summaryLimit` | `9000` | Characters of the summary shown before Show all. |
@@ -65,6 +65,12 @@ Expand implementation and Show implementation ask `bodyModel` for one symbol's b
 2. The implementations already generated for the other symbols, the current file's own first, so names, signatures and behavior stay consistent across the plan.
 3. Real project files. These are the other planned files as they are on disk and the files the current file imports. The `model` option also picks up to 8 files from the project's file list (`git ls-files`): the types, helpers and callers the symbol needs.
 4. The current content of the file and the symbol to implement.
+
+## How the diagram is generated
+
+Generate change diagram starts a subagent of the mod's own type. The subagent runs in a clean session: no history, no CLAUDE.md, and only the read-only tools Read, Grep and Glob. Its prompt holds the whole plan and the current text of the planned files. It answers with a JSON graph: every planned file with its symbols, and the calls between them. The page draws the graph and never drops a planned block.
+
+A click on a symbol starts a second request. The mod first runs `git grep` for the symbol name and names the function that holds each hit. The clean session gets those candidates, drops false positives, adds the callers the search missed, and answers up to 20 callers. The rest becomes one block marked others. If no subagent can start, a model call without tools answers from the plan and the file texts. If that call fails too, the page shows the text search result alone and says so.
 
 ## Security of the page
 
@@ -104,11 +110,12 @@ claude plugin test .
 node --test tests/server.node.mjs tests/page.node.mjs
 ```
 
-The first two need Claude Code 2.1.275 or newer. The last one checks the page server end to end and the page modules that render Markdown, code, diffs and the tree.
+The first two need Claude Code 2.1.275 or newer. The last one checks the page server end to end and the page modules that render Markdown, code, diffs, the tree and the diagram layout.
 
 ## Limits
 
 - The built-in plan dialog remains after approval: one Yes click.
 - Claude must write the `plan-crutches` block for the structured view. Without it, the mod asks the model to extract the structure, and falls back to the Markdown alone.
 - The page server runs only where the session runs, so a session in the cloud has the pane alone.
-- The diagram editor is simple: no undo, no resize, no zoom.
+- A session keeps the mod it loaded at its start. After an update of the mod, start a new session. If the page is newer than the mod of its session, the page shows a warning.
+- The diagram shows calls as the clean session read them. It is a reading of the code, not a compiler's analysis.

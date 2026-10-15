@@ -153,7 +153,7 @@ export function renderPane(el: PaneEl, m: PaneModel, a: PaneActions) {
       {renderHeader(ctx, toggleLang)}
       {renderTabs(ctx)}
       {m.ui.tab === 'changes' && renderChanges(ctx)}
-      {m.ui.tab === 'diagram' && <Text dimColor>{t(lang, 'comingSoon')}</Text>}
+      {m.ui.tab === 'diagram' && <Text dimColor>{t(lang, 'diagramOnPage')}</Text>}
       {m.ui.tab === 'ask' && renderAsk(ctx)}
     </Box>
   )

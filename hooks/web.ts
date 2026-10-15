@@ -2,11 +2,8 @@
 // (actions), what the mod sends it (the snapshot) and the server's stdout
 // protocol. Nothing here touches `$`; register.tsx wires it.
 import type {
-  Canvas,
-  CanvasEdge,
-  CanvasNode,
-  CanvasStroke,
   CommentTarget,
+  Diagram,
   FileCache,
   GeneratedBody,
   Lang,
@@ -28,8 +25,9 @@ export type WebAction =
   | { type: 'generateBody'; path: string; symbol: string }
   | { type: 'ask'; id?: string; question: string; focus?: string; target?: CommentTarget }
   | { type: 'askMore'; id: string; question: string }
-  | { type: 'canvas'; canvas: Canvas }
-  | { type: 'canvasSvg'; svg: string }
+  | { type: 'generateDiagram' }
+  | { type: 'callers'; path: string; symbol: string }
+  | { type: 'diagramSvg'; svg: string }
   | { type: 'setLang'; lang: Lang }
   | { type: 'ping' }
 
@@ -40,8 +38,16 @@ export type ServerMessage =
   | { type: 'fatal'; text: string }
 
 const MAX_TEXT = 20000
-const MAX_NODES = 500
-const MAX_POINTS = 5000
+
+/**
+ * The shape of the state and the set of actions the mod understands. The page
+ * carries the same number and warns when they differ: a session keeps the mod
+ * it loaded at its start, while the server serves the page files from disk,
+ * so after an update of the mod an open session shows a newer page.
+ */
+import { WEB_PROTOCOL } from './state'
+
+export { WEB_PROTOCOL }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 const str = (value: unknown, limit = MAX_TEXT): string | undefined => (typeof value === 'string' ? value.slice(0, limit) : undefined)
@@ -62,57 +68,6 @@ export function parseTarget(raw: unknown): CommentTarget {
     if (a !== undefined && b !== undefined) target.lines = [Math.min(a, b), Math.max(a, b)]
   }
   return target
-}
-
-export function parseCanvas(raw: unknown): Canvas | null {
-  if (!isRecord(raw)) return null
-  const nodes: CanvasNode[] = []
-  const edges: CanvasEdge[] = []
-  const strokes: CanvasStroke[] = []
-  if (Array.isArray(raw.nodes)) {
-    for (const item of raw.nodes.slice(0, MAX_NODES)) {
-      if (!isRecord(item)) continue
-      const id = str(item.id, 64)
-      const x = num(item.x)
-      const y = num(item.y)
-      const w = num(item.w)
-      const h = num(item.h)
-      if (!id || x === undefined || y === undefined || w === undefined || h === undefined) continue
-      const node: CanvasNode = { id, x, y, w, h, label: str(item.label, 500) ?? '' }
-      if (item.kind === 'text') node.kind = 'text'
-      nodes.push(node)
-    }
-  }
-  const ids = new Set(nodes.map(node => node.id))
-  if (Array.isArray(raw.edges)) {
-    for (const item of raw.edges.slice(0, MAX_NODES * 2)) {
-      if (!isRecord(item)) continue
-      const id = str(item.id, 64)
-      const from = str(item.from, 64)
-      const to = str(item.to, 64)
-      if (!id || !from || !to || !ids.has(from) || !ids.has(to)) continue
-      const edge: CanvasEdge = { id, from, to }
-      const label = str(item.label, 500)
-      if (label) edge.label = label
-      edges.push(edge)
-    }
-  }
-  if (Array.isArray(raw.strokes)) {
-    for (const item of raw.strokes.slice(0, MAX_NODES)) {
-      if (!isRecord(item) || !Array.isArray(item.points)) continue
-      const id = str(item.id, 64)
-      if (!id) continue
-      const points: [number, number][] = []
-      for (const point of item.points.slice(0, MAX_POINTS)) {
-        if (!Array.isArray(point)) continue
-        const x = num(point[0])
-        const y = num(point[1])
-        if (x !== undefined && y !== undefined) points.push([x, y])
-      }
-      if (points.length > 1) strokes.push({ id, points })
-    }
-  }
-  return { nodes, edges, strokes }
 }
 
 export function parseAction(raw: unknown): WebAction | null {
@@ -153,13 +108,16 @@ export function parseAction(raw: unknown): WebAction | null {
       const question = str(raw.question)?.trim()
       return id && question ? { type: 'askMore', id, question } : null
     }
-    case 'canvas': {
-      const canvas = parseCanvas(raw.canvas)
-      return canvas ? { type: 'canvas', canvas } : null
+    case 'generateDiagram':
+      return { type: 'generateDiagram' }
+    case 'callers': {
+      const path = str(raw.path, 2000)
+      const symbol = str(raw.symbol, 500)
+      return path && symbol ? { type: 'callers', path, symbol } : null
     }
-    case 'canvasSvg': {
+    case 'diagramSvg': {
       const svg = str(raw.svg, 2_000_000)
-      return svg && svg.trimStart().startsWith('<svg') ? { type: 'canvasSvg', svg } : null
+      return svg && svg.trimStart().startsWith('<svg') ? { type: 'diagramSvg', svg } : null
     }
     case 'setLang':
       return { type: 'setLang', lang: raw.lang === 'uk' ? 'uk' : 'en' }
@@ -240,7 +198,7 @@ export function buildSnapshot(args: {
   comments: ReviewComment[]
   bodies: Record<string, GeneratedBody>
   qa: QaItem[]
-  canvas: Canvas
+  diagram: Diagram
   files: FileCache
   lang: Lang
   summaryLimit: number
@@ -254,12 +212,13 @@ export function buildSnapshot(args: {
     comments: args.comments,
     bodies: args.bodies,
     qa: args.qa,
-    canvas: args.canvas,
+    diagram: args.diagram,
     files: fileEntries(args.plan, args.files),
     lang: args.lang,
     summaryLimit: args.summaryLimit,
     cwd: args.cwd,
     ...(args.notice ? { notice: args.notice } : {}),
     generatedAt: new Date(args.nowMs).toISOString(),
+    protocol: WEB_PROTOCOL,
   }
 }

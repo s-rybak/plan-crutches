@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { parsePlan } from '../hooks/plan-parser.ts'
 import { DEMO_PLAN } from '../hooks/demo-plan.ts'
 import { deletedDiff, newFileStub, stubDiff } from '../hooks/diff.ts'
+import { WEB_PROTOCOL } from '../hooks/state.ts'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const demoSrc = path.join(here, '..', 'fixtures', 'demo-src')
@@ -39,11 +40,12 @@ const state = {
   comments: [],
   bodies: {},
   qa: [],
-  canvas: { nodes: [], edges: [], strokes: [] },
+  diagram: { status: 'idle', callers: {} },
   files,
   lang: process.env.PLAN_CRUTCHES_LANG || 'en',
   summaryLimit: 9000,
   cwd: path.resolve(here, '..'),
   generatedAt: new Date().toISOString(),
+  protocol: WEB_PROTOCOL,
 }
 process.stdout.write(JSON.stringify(state, null, 2))

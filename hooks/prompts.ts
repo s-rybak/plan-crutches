@@ -1,4 +1,4 @@
-import type { Canvas, CommentTarget, GeneratedBody, PlanFile, PlanModel, PlanSymbol, QaItem, ReviewComment } from '../types'
+import type { CommentTarget, GeneratedBody, PlanFile, PlanModel, PlanSymbol, QaItem, ReviewComment } from '../types'
 
 export const BLOCK_SCHEMA = `\`\`\`plan-crutches
 {
@@ -265,25 +265,6 @@ export function importCandidates(fromPath: string, spec: string): string[] {
   return candidates.filter(path => !path.includes('//'))
 }
 
-export function canvasText(canvas: Canvas): string {
-  if (canvas.nodes.length === 0 && canvas.edges.length === 0 && canvas.strokes.length === 0) return ''
-  const lines: string[] = []
-  if (canvas.nodes.length) {
-    lines.push('Nodes:')
-    for (const node of canvas.nodes) lines.push(`- ${node.id}: ${node.label || '(unnamed)'}`)
-  }
-  if (canvas.edges.length) {
-    lines.push('Edges:')
-    for (const edge of canvas.edges) {
-      const from = canvas.nodes.find(node => node.id === edge.from)?.label ?? edge.from
-      const to = canvas.nodes.find(node => node.id === edge.to)?.label ?? edge.to
-      lines.push(`- ${from} -> ${to}${edge.label ? `: ${edge.label}` : ''}`)
-    }
-  }
-  if (canvas.strokes.length) lines.push(`Freehand strokes: ${canvas.strokes.length} (see the SVG file).`)
-  return lines.join('\n')
-}
-
 function commentLine(comment: ReviewComment): string {
   const where: string[] = []
   if (comment.target.symbol) where.push(`symbol ${comment.target.symbol}`)
@@ -292,7 +273,7 @@ function commentLine(comment: ReviewComment): string {
   return `  - ${prefix}${comment.text}`
 }
 
-export function revisionPrompt(plan: PlanModel, comments: readonly ReviewComment[], canvas: Canvas, version: number, svgPath?: string): string {
+export function revisionPrompt(plan: PlanModel, comments: readonly ReviewComment[], version: number): string {
   const planLevel = comments.filter(one => !one.target.path)
   const byPath = new Map<string, ReviewComment[]>()
   for (const comment of comments) {
@@ -317,10 +298,6 @@ export function revisionPrompt(plan: PlanModel, comments: readonly ReviewComment
     }
     sections.push('Comments by file:\n' + blocks.join('\n'))
   }
-  const diagram = canvasText(canvas)
-  if (diagram) {
-    sections.push('Architecture the user drew (nodes and edges):\n' + diagram + (svgPath ? `\nSVG: ${svgPath}` : ''))
-  }
   return sections.join('\n\n')
 }
 
@@ -344,11 +321,20 @@ function selectionContext(target: CommentTarget | undefined): string {
   return `The user selected this text${where ? ` in ${where}` : ''}:\n"""\n${target.selection.slice(0, 4000)}\n"""\n\n`
 }
 
+/**
+ * How much of the plan an answer sees. The fork runs over the session's
+ * transcript, which may not hold the plan (a resumed or compacted session,
+ * the demo plan), so the prompt carries the plan itself; this tail of a fork
+ * is never cached, so it stays bounded.
+ */
+const ASK_SURFACE_LIMIT = 16000
+
 export function askPrompt(plan: PlanModel, question: string, focus?: string, target?: CommentTarget): string {
   const where = focus && !target?.path ? `The user is looking at ${focus}. ` : ''
   return (
     `Plan Crutches question about the plan "${plan.title}" currently under review. ${where}` +
-    'Answer briefly in the language of the question, from the plan and the project you already know. Do not change the plan and do not call tools.\n\n' +
+    'Answer briefly in the language of the question, from the plan below and the project you already know. Do not change the plan and do not call tools.\n\n' +
+    `${planSurface(plan, ASK_SURFACE_LIMIT)}\n\n` +
     selectionContext(target) +
     `Question: ${question}`
   )
@@ -364,7 +350,8 @@ export function askMorePrompt(plan: PlanModel, item: QaItem, question: string): 
   }
   return (
     `Plan Crutches follow-up question about the plan "${plan.title}" currently under review. ` +
-    'Continue the conversation below. Answer briefly in the language of the question, from the plan and the project you already know. Do not change the plan and do not call tools.\n\n' +
+    'Continue the conversation below. Answer briefly in the language of the question, from the plan below and the project you already know. Do not change the plan and do not call tools.\n\n' +
+    `${planSurface(plan, ASK_SURFACE_LIMIT)}\n\n` +
     selectionContext(item.target) +
     `Conversation so far:\n${turns.join('\n\n')}\n\nUser: ${question}`
   )

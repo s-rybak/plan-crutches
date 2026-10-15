@@ -1,5 +1,6 @@
-import type { Canvas, PlanModel, QaItem, Review, ReviewComment } from '../types'
-import { canvasText, describeQaTarget, threadText } from './prompts'
+import type { Diagram, PlanModel, QaItem, Review, ReviewComment } from '../types'
+import { diagramText } from './diagram'
+import { describeQaTarget, threadText } from './prompts'
 
 export function slugify(text: string): string {
   return text
@@ -34,11 +35,11 @@ export function renderRecord(args: {
   plan: PlanModel
   review: Review
   comments: readonly ReviewComment[]
-  canvas: Canvas
+  diagram?: Diagram
   qa?: readonly QaItem[]
   nowMs: number
 }): string {
-  const { plan, review, comments, canvas, nowMs } = args
+  const { plan, review, comments, nowMs } = args
   const qa = args.qa ?? []
   const out: string[] = []
   out.push(`# ${plan.title}`)
@@ -99,9 +100,11 @@ export function renderRecord(args: {
       out.push('')
     }
   }
-  const diagram = canvasText(canvas)
+  const diagram = diagramText(args.diagram?.graph)
   if (diagram) {
     out.push('## Diagram')
+    out.push('')
+    out.push(`Generated for version ${args.diagram?.version ?? review.version}${review.diagramSvgPath ? ` | SVG: ${review.diagramSvgPath}` : ''}`)
     out.push('')
     out.push(diagram)
     out.push('')

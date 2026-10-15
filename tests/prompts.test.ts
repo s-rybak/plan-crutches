@@ -86,11 +86,15 @@ describe('prompts', () => {
     expect(first).toContain('The user selected this text in src/auth/session.ts, symbol refreshSession, lines 4:')
     expect(first).toContain('const cache = new Map()')
     expect(first).not.toContain('The user is looking at')
+    // The fork may run over a transcript without the plan, so the prompt carries it.
+    expect(first).toContain('All planned files and symbols:')
+    expect(first).toContain('- src/auth/session.ts (')
     expect(askPrompt(plan, 'Why?', 'src/auth/session.ts')).toContain('The user is looking at src/auth/session.ts')
     const more = askMorePrompt(plan, THREAD, 'What about eviction?')
     expect(more).toContain('User: Why a cache?\n\nAssistant: So parallel callers share one request.')
     expect(more).toContain('User: Per process only?\n\nAssistant: Yes, Redis comes later.')
     expect(more).not.toContain('And TTL?')
+    expect(more).toContain('All planned files and symbols:')
     expect(more.endsWith('User: What about eviction?')).toBe(true)
     expect(threadText(THREAD)).toBe('Q: Why a cache?\nA: So parallel callers share one request.\nQ: Per process only?\nA: Yes, Redis comes later.')
   })
@@ -101,7 +105,6 @@ describe('prompts', () => {
       plan,
       review: { status: 'reviewing', version: 1, parsedFrom: 'block', warnings: [], history: [], previousPaths: [] },
       comments: [],
-      canvas: { nodes: [], edges: [], strokes: [] },
       qa: [THREAD, { id: 'q2', question: 'Pending?', status: 'asking' }],
       nowMs: 0,
     })

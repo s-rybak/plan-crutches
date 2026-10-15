@@ -42,8 +42,7 @@ export type Review = {
   warnings: string[]
   history: string[]
   previousPaths: string[]
-  canvasSentInVersion?: number
-  canvasSvgPath?: string
+  diagramSvgPath?: string
   isDemo?: boolean
 }
 
@@ -118,10 +117,49 @@ export type QaItem = {
   createdInVersion?: number
 }
 
-export type CanvasNode = { id: string; x: number; y: number; w: number; h: number; label: string; kind?: 'box' | 'text' }
-export type CanvasEdge = { id: string; from: string; to: string; label?: string }
-export type CanvasStroke = { id: string; points: [number, number][] }
-export type Canvas = { nodes: CanvasNode[]; edges: CanvasEdge[]; strokes: CanvasStroke[] }
+export type DiagramStatus = 'idle' | 'loading' | 'ready' | 'failed'
+export type DiagramFileStatus = FileStatus | 'unchanged'
+
+/** One row of a diagram block: a planned symbol, or an existing one a callers query brought in. */
+export type DiagramSymbol = { name: string; kind: SymbolKind; line?: number }
+
+/** One block of the diagram: a file with the symbols the plan changes (a deleted file: its exported symbols). */
+export type DiagramFile = { path: string; status: DiagramFileStatus; symbols: DiagramSymbol[] }
+
+export type DiagramRef = { path: string; symbol: string }
+
+/** `from` calls `to` (kind `call`), or uses it as a type or a constant (kind `use`). */
+export type DiagramEdge = { from: DiagramRef; to: DiagramRef; kind: 'call' | 'use' }
+
+/** The change graph: every planned file with its symbols, and the calls between them. */
+export type DiagramGraph = { files: DiagramFile[]; edges: DiagramEdge[] }
+
+/** One place in the project that calls or uses a planned symbol: the enclosing symbol of the use. */
+export type DiagramCaller = { path: string; symbol: string; kind?: SymbolKind; line?: number }
+
+/** The callers of one planned symbol, as the page asked for them; `more` is how many beyond the limit. */
+export type CallersQuery = {
+  status: 'loading' | 'ready' | 'failed'
+  callers: DiagramCaller[]
+  more: number
+  /** Where the list came from: the clean session, a model call without files, or the text search alone. */
+  source?: 'session' | 'model' | 'search'
+  error?: string
+}
+
+/** Where the diagram came from: a clean session with read-only tools, or a model call without them. */
+export type DiagramSource = 'session' | 'model'
+
+/** The generated change diagram and the callers queries made on it, keyed `path#symbol`. */
+export type Diagram = {
+  status: DiagramStatus
+  graph?: DiagramGraph
+  /** The plan version the graph was generated for. */
+  version?: number
+  source?: DiagramSource
+  error?: string
+  callers: Record<string, CallersQuery>
+}
 
 export type FileCache = Record<string, string | null>
 
@@ -151,13 +189,15 @@ export type WebSnapshot = {
   comments: ReviewComment[]
   bodies: Record<string, GeneratedBody>
   qa: QaItem[]
-  canvas: Canvas
+  diagram: Diagram
   files: Record<string, WebFileEntry>
   lang: Lang
   summaryLimit: number
   cwd: string
   notice?: WebNotice
   generatedAt: string
+  /** The shape of this state and of the actions the mod understands; the page warns when its own number differs. */
+  protocol: number
 }
 
 declare module 'claude-code' {
@@ -171,7 +211,7 @@ declare module 'claude-code' {
       lastPrompt: string
       bodies: Record<string, GeneratedBody>
       qa: QaItem[]
-      canvas: Canvas
+      diagram: Diagram
       files: FileCache
       web: WebState
     }

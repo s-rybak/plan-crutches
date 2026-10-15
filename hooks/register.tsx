@@ -2,8 +2,10 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, HookStream, PluginOptions, ProcessSpawnChunk, ProcessSpawnResult, Register, Timer } from 'claude-code'
 
 import type {
-  Canvas,
+  CallersQuery,
   CommentTarget,
+  Diagram,
+  DiagramRef,
   FileCache,
   GeneratedBody,
   Lang,
@@ -21,6 +23,24 @@ import type {
   WebState,
 } from '../types'
 import { DEMO_PLAN } from './demo-plan'
+import {
+  CALLERS_LIMIT,
+  DIAGRAM_AGENT_DESCRIPTION,
+  DIAGRAM_AGENT_NAME,
+  DIAGRAM_AGENT_PROMPT,
+  DIAGRAM_SYSTEM,
+  callersPrompt,
+  diagramPrompt,
+  enclosingSymbol,
+  groupCandidates,
+  isDeclarationOf,
+  isImportLine,
+  loadingCallers,
+  parseCallersReply,
+  parseDiagramReply,
+  parseGrepOutput,
+} from './diagram'
+import type { CallerCandidate } from './diagram'
 import { codeFromReply } from './diff'
 import { extractJson, normalizePlan, parsePlan, planFromMarkdown, titleFromMarkdown } from './plan-parser'
 import { renderPane, withoutKeys } from './pane'
@@ -118,9 +138,9 @@ const qaAtom = atom<'plan-crutches', 'qa'>(
   [] as QaItem[],
 )
 
-const canvasAtom = atom<'plan-crutches', 'canvas'>(
-  { plugin: 'plan-crutches', key: 'canvas' } as const,
-  { nodes: [], edges: [], strokes: [] } as Canvas,
+const diagramAtom = atom<'plan-crutches', 'diagram'>(
+  { plugin: 'plan-crutches', key: 'diagram' } as const,
+  { status: 'idle', callers: {} } as Diagram,
 )
 
 const filesAtom = atom<'plan-crutches', 'files'>(
@@ -136,6 +156,9 @@ const webAtom = atom<'plan-crutches', 'web'>(
 const PANE_TITLE = 'Plan Review'
 const SERVER_START_MS = 8000
 const SERVER_IDLE_MS = 600_000
+const DIAGRAM_AGENT_TYPE = `plan-crutches:${DIAGRAM_AGENT_NAME}`
+const AGENT_WAIT_MS = 900_000
+const EMPTY_DIAGRAM: Diagram = { status: 'idle', callers: {} }
 
 function readOptions(raw: PluginOptions): Options {
   const language = raw.language === 'uk' ? 'uk' : 'en'
@@ -351,14 +374,14 @@ async function pingServer($: EngineInterface): Promise<boolean> {
 }
 
 async function buildWebSnapshot($: EngineInterface): Promise<WebSnapshot> {
-  const [plan, review, comments, ui, bodies, qa, canvas, files] = await Promise.all([
+  const [plan, review, comments, ui, bodies, qa, diagram, files] = await Promise.all([
     read($, planAtom),
     read($, reviewAtom),
     read($, commentsAtom),
     read($, uiAtom),
     read($, bodiesAtom),
     read($, qaAtom),
-    read($, canvasAtom),
+    read($, diagramAtom),
     read($, filesAtom),
   ])
   let cwd = ''
@@ -373,7 +396,7 @@ async function buildWebSnapshot($: EngineInterface): Promise<WebSnapshot> {
     comments,
     bodies,
     qa,
-    canvas,
+    diagram,
     files,
     lang: ui.lang,
     summaryLimit: options.summaryLimit,
@@ -451,7 +474,7 @@ async function resetAll($: EngineInterface): Promise<void> {
   await update($, planAtom, () => null)
   await update($, reviewAtom, () => EMPTY_REVIEW)
   await update($, commentsAtom, () => [])
-  await update($, canvasAtom, () => ({ nodes: [], edges: [], strokes: [] }))
+  await update($, diagramAtom, () => EMPTY_DIAGRAM)
   await update($, qaAtom, () => [])
   await update($, bodiesAtom, () => ({}))
   await update($, filesAtom, () => ({}))
@@ -492,16 +515,16 @@ function applyTask(plan: PlanModel, task: TaskCapture): void {
 }
 
 async function writeRecord($: EngineInterface): Promise<void> {
-  const [plan, review, comments, canvas, qa] = await Promise.all([
+  const [plan, review, comments, diagram, qa] = await Promise.all([
     read($, planAtom),
     read($, reviewAtom),
     read($, commentsAtom),
-    read($, canvasAtom),
+    read($, diagramAtom),
     read($, qaAtom),
   ])
   if (!plan || review.isDemo || !review.recordPath) return
   try {
-    const text = renderRecord({ plan, review, comments, canvas, qa, nowMs: await $.clock.now() })
+    const text = renderRecord({ plan, review, comments, diagram, qa, nowMs: await $.clock.now() })
     await $.fs.write(review.recordPath, text)
   } catch (error) {
     $.ui.log(`plan-crutches: could not write ${review.recordPath}: ${String(error)}`, { to: 'debug' })
@@ -564,7 +587,7 @@ async function receivePlan($: EngineInterface, markdown: string, planFilePath: s
     )
   } else {
     await update($, commentsAtom, () => [])
-    await update($, canvasAtom, () => ({ nodes: [], edges: [], strokes: [] }))
+    await update($, diagramAtom, () => EMPTY_DIAGRAM)
     await update($, qaAtom, () => [])
   }
   await update($, planAtom, () => plan)
@@ -585,8 +608,7 @@ async function receivePlan($: EngineInterface, markdown: string, planFilePath: s
     history: [...(isRevision ? current.history : []), `v${version} received ${now}`],
     ...(planFilePath ? { planFilePath } : {}),
     ...(recordPath ? { recordPath } : {}),
-    ...(isRevision && current.canvasSvgPath ? { canvasSvgPath: current.canvasSvgPath } : {}),
-    ...(isRevision && current.canvasSentInVersion !== undefined ? { canvasSentInVersion: current.canvasSentInVersion } : {}),
+    ...(isRevision && current.diagramSvgPath ? { diagramSvgPath: current.diagramSvgPath } : {}),
     ...(isDemo ? { isDemo: true } : {}),
   }))
   await writeRecord($)
@@ -595,28 +617,18 @@ async function receivePlan($: EngineInterface, markdown: string, planFilePath: s
 }
 
 async function submit($: EngineInterface): Promise<void> {
-  const [plan, review, comments, canvas] = await Promise.all([
-    read($, planAtom),
-    read($, reviewAtom),
-    read($, commentsAtom),
-    read($, canvasAtom),
-  ])
+  const [plan, review, comments] = await Promise.all([read($, planAtom), read($, reviewAtom), read($, commentsAtom)])
   if (!plan || review.status !== 'reviewing') return
   const pending = comments.filter(one => one.sentInVersion === undefined && one.resolvedInVersion === undefined)
-  const canvasIsNew =
-    canvas.nodes.length + canvas.edges.length + canvas.strokes.length > 0 && (review.canvasSentInVersion ?? 0) < review.version
   const now = await isoNow($)
   if (review.isDemo) {
-    const text =
-      pending.length || canvasIsNew
-        ? `Demo: ${pending.length} comments would go to Claude as a revision request.`
-        : 'Demo: the plan would be approved.'
+    const text = pending.length ? `Demo: ${pending.length} comments would go to Claude as a revision request.` : 'Demo: the plan would be approved.'
     $.ui.toast(text)
     setNotice(text)
     changed($)
     return
   }
-  if (pending.length === 0 && !canvasIsNew) {
+  if (pending.length === 0) {
     await update($, reviewAtom, current => ({ ...current, status: 'approved' as const, history: [...current.history, `v${review.version} approved ${now}`] }))
     try {
       await $.prompt.submit({ text: approvePrompt(review.version), asUser: true })
@@ -636,11 +648,10 @@ async function submit($: EngineInterface): Promise<void> {
   await update($, reviewAtom, current => ({
     ...current,
     status: 'revising' as const,
-    canvasSentInVersion: canvasIsNew ? review.version : current.canvasSentInVersion ?? 0,
     history: [...current.history, `v${review.version} sent back with ${pending.length} comments ${now}`],
   }))
   try {
-    await $.prompt.submit({ text: revisionPrompt(plan, pending, canvas, review.version, review.canvasSvgPath), asUser: true })
+    await $.prompt.submit({ text: revisionPrompt(plan, pending, review.version), asUser: true })
   } catch (error) {
     await update($, commentsAtom, list => list.map(one => (sentIds.has(one.id) ? { id: one.id, target: one.target, text: one.text, createdInVersion: one.createdInVersion } : one)))
     await update($, reviewAtom, current => ({ ...current, status: 'reviewing' as const }))
@@ -785,19 +796,24 @@ async function generateBody($: EngineInterface, file: PlanFile, symbol: PlanSymb
 
 /** One answer from the session's fork, else from the plan text alone. */
 async function answerQuestion($: EngineInterface, plan: PlanModel, prompt: string): Promise<{ answer?: string; failure?: string }> {
-  const forked = await $.model.fork({ prompt })
-  if (forked.isAnswered) return { answer: forked.text }
-  if (forked.reason !== 'nothing-to-fork') return { failure: forked.reason }
-  const direct = await $.model.complete({
-    model: options.model,
-    system: 'You answer questions about an implementation plan from the plan text alone. Be brief; answer in the language of the question.',
-    prompt: `Plan "${plan.title}":\n${plan.summary.slice(0, 8000)}\n\nFiles:\n${plan.files
-      .map(file => `- [${file.status}] ${file.path}: ${file.description}`)
-      .join('\n')}\n\n${prompt}`,
-    maxTokens: 1500,
-    timeoutMs: 90_000,
-  })
-  return direct.isAnswered ? { answer: direct.text } : { failure: direct.reason }
+  // The prompt already carries the plan (askPrompt); the fork adds the session.
+  // Whatever goes wrong becomes a failed turn, never a thread stuck on "asking".
+  try {
+    const forked = await $.model.fork({ prompt })
+    if (forked.isAnswered) return { answer: forked.text }
+    if (forked.reason !== 'nothing-to-fork') return { failure: forked.reason === 'api-error' ? `${forked.reason} ${forked.status}` : forked.reason }
+    const direct = await $.model.complete({
+      model: options.model,
+      system: `You answer questions about the implementation plan "${plan.title}", which is under review. Be brief; answer in the language of the question.`,
+      prompt,
+      maxTokens: 1500,
+      timeoutMs: 90_000,
+    })
+    if (direct.isAnswered) return { answer: direct.text }
+    return { failure: direct.reason === 'api-error' ? `${direct.reason} ${direct.status}` : direct.reason }
+  } catch (error) {
+    return { failure: String(error) }
+  }
 }
 
 async function ask($: EngineInterface, question: string, focus?: string, target?: CommentTarget, wantedId?: string): Promise<void> {
@@ -902,23 +918,194 @@ async function deleteComment($: EngineInterface, id: string): Promise<void> {
   changed($)
 }
 
-async function setCanvas($: EngineInterface, canvas: Canvas): Promise<void> {
-  await update($, canvasAtom, () => canvas)
+// ---- the change diagram -----------------------------------------------------
+// A clean session draws it: a subagent of the mod's own type, read-only tools,
+// no history, the plan in its prompt. Its answer arrives as its turn.complete.
+// Where no subagent can start, a tool-less completion answers from the plan
+// and the planned files' text.
+
+let diagramAgentReady = false
+const agentWaiters = new Map<string, (answer: string | undefined) => void>()
+
+async function registerDiagramAgent($: EngineInterface): Promise<void> {
+  try {
+    await $.agent.register({
+      name: DIAGRAM_AGENT_NAME,
+      description: DIAGRAM_AGENT_DESCRIPTION,
+      prompt: DIAGRAM_AGENT_PROMPT,
+      tools: ['Read', 'Grep', 'Glob'],
+      model: options.model,
+      omitClaudeMd: true,
+      background: true,
+      maxTurns: 60,
+    })
+    diagramAgentReady = true
+  } catch (error) {
+    diagramAgentReady = false
+    $.ui.log(`plan-crutches: the diagram agent did not register, model calls answer instead: ${String(error)}`, { to: 'debug' })
+  }
+}
+
+/** The answer of a subagent run, once its turn completes; undefined when it ends without one or after AGENT_WAIT_MS. */
+function awaitAgent($: EngineInterface, agentId: string): Promise<string | undefined> {
+  return new Promise(resolve => {
+    agentWaiters.set(agentId, resolve)
+    void $.clock.sleep(AGENT_WAIT_MS).then(() => {
+      if (agentWaiters.delete(agentId)) resolve(undefined)
+    })
+  })
+}
+
+function settleAgent(agentId: string, answer: string | undefined): void {
+  const waiter = agentWaiters.get(agentId)
+  if (!waiter) return
+  agentWaiters.delete(agentId)
+  waiter(answer)
+}
+
+type FreshAnswer = { text?: string; source: 'session' | 'model'; failure?: string }
+
+/**
+ * One answer from a clean session: the diagram agent with `prompt` in `cwd`,
+ * else a tool-less completion with `fallbackPrompt`.
+ */
+async function freshSessionAnswer($: EngineInterface, prompt: string, fallbackPrompt: string, cwd: string, description: string): Promise<FreshAnswer> {
+  if (diagramAgentReady) {
+    try {
+      const spawned = await $.agent.spawn({ subagentType: DIAGRAM_AGENT_TYPE, prompt, description, cwd })
+      if (spawned.deny) {
+        $.ui.log(`plan-crutches: the diagram session was refused: ${spawned.deny}`, { to: 'debug' })
+      } else if (spawned.agentId) {
+        const answer = await awaitAgent($, spawned.agentId)
+        if (answer && answer.trim()) return { text: answer, source: 'session' }
+        $.ui.log('plan-crutches: the diagram session ended without an answer; a model call answers instead', { to: 'debug' })
+      }
+    } catch (error) {
+      $.ui.log(`plan-crutches: the diagram session did not start: ${String(error)}`, { to: 'debug' })
+    }
+  }
+  const reply = await $.model.complete({
+    model: options.model,
+    system: DIAGRAM_SYSTEM,
+    prompt: fallbackPrompt,
+    maxTokens: 8000,
+    timeoutMs: 240_000,
+  })
+  if (reply.isAnswered) return { text: reply.text, source: 'model' }
+  const detail = reply.reason === 'api-error' ? `${reply.reason} ${reply.status}` : reply.reason
+  return { source: 'model', failure: detail }
+}
+
+async function generateDiagram($: EngineInterface): Promise<void> {
+  const [plan, review, current] = await Promise.all([read($, planAtom), read($, reviewAtom), read($, diagramAtom)])
+  if (!plan || current.status === 'loading') return
+  await update($, diagramAtom, () => ({ status: 'loading' as const, callers: {} }))
+  changed($)
+  const base = await projectBase($)
+  const texts: Record<string, string | null> = {}
+  for (const file of plan.files) {
+    if (file.status !== 'new') texts[file.path] = await readProjectFile($, base, file.path)
+  }
+  const answer = await freshSessionAnswer($, diagramPrompt(plan, texts, { tools: true }), diagramPrompt(plan, texts, { tools: false }), base, 'Plan Crutches: change diagram')
+  const graph = answer.text ? parseDiagramReply(answer.text, plan) : null
+  if (graph) {
+    await update($, diagramAtom, () => ({ status: 'ready' as const, graph, version: review.version, source: answer.source, callers: {} }))
+  } else {
+    const error = answer.failure ?? 'the answer held no diagram'
+    await update($, diagramAtom, () => ({ status: 'failed' as const, error, callers: {} }))
+  }
   await writeRecord($)
   changed($)
 }
 
-async function saveCanvasSvg($: EngineInterface, svg: string): Promise<void> {
+/** Lines of the project that name the symbol, from git grep, else grep; each with its enclosing symbol. */
+async function searchCallers($: EngineInterface, base: string, ref: DiagramRef): Promise<CallerCandidate[]> {
+  // a method named `Class.method` is called by its last part
+  const needle = ref.symbol.split('.').pop() || ref.symbol
+  let output = ''
+  const commands = [
+    ['git', 'grep', '-n', '-I', '-w', '--untracked', '--', needle],
+    ['grep', '-rnIw', '--exclude-dir=node_modules', '--exclude-dir=.git', '--exclude-dir=dist', '--exclude-dir=build', '--', needle, '.'],
+  ]
+  for (const argv of commands) {
+    try {
+      const ran = await $.process.run(argv, { cwd: base, timeoutMs: 30_000 })
+      if (ran.exitCode === 0 || ran.exitCode === 1) {
+        output = ran.stdout
+        break
+      }
+    } catch {
+      // try the next search
+    }
+  }
+  const hits = parseGrepOutput(output)
+  const lines = new Map<string, string[] | null>()
+  const candidates: CallerCandidate[] = []
+  for (const hit of hits) {
+    if (hit.path === ref.path && isDeclarationOf(hit.text, needle)) continue
+    if (isImportLine(hit.text)) continue
+    if (!lines.has(hit.path)) {
+      if (lines.size >= 60) break
+      const text = await readProjectFile($, base, hit.path)
+      lines.set(hit.path, text === null ? null : text.replace(/\r\n?/g, '\n').split('\n'))
+    }
+    const fileLines = lines.get(hit.path)
+    const enclosing = fileLines ? enclosingSymbol(fileLines, hit.line - 1) : { name: '(module)', kind: 'other' as const }
+    if (hit.path === ref.path && enclosing.name === ref.symbol) continue
+    candidates.push({ path: hit.path, line: hit.line, text: hit.text, enclosing: enclosing.name, kind: enclosing.kind })
+  }
+  return candidates
+}
+
+/** What a session may put before a project-relative path: the folder itself, or its place inside the git repository. */
+async function pathPrefixes($: EngineInterface, base: string): Promise<string[]> {
+  const folder = base.replace(/\/+$/, '')
+  const prefixes = [`${folder}/`]
+  try {
+    const ran = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: base, timeoutMs: 10_000 })
+    const top = ran.stdout.trim().replace(/\/+$/, '')
+    if (ran.exitCode === 0 && top && folder.startsWith(`${top}/`)) prefixes.push(`${folder.slice(top.length + 1)}/`)
+  } catch {
+    // not a git repository
+  }
+  return prefixes
+}
+
+async function findCallers($: EngineInterface, ref: DiagramRef): Promise<void> {
+  const key = bodyKey(ref.path, ref.symbol)
+  const [plan, current] = await Promise.all([read($, planAtom), read($, diagramAtom)])
+  if (!plan || current.status !== 'ready') return
+  const existing = current.callers[key]
+  if (existing && existing.status === 'loading') return
+  await update($, diagramAtom, state => ({ ...state, callers: { ...state.callers, [key]: loadingCallers() } }))
+  changed($)
+  const base = await projectBase($)
+  const candidates = await searchCallers($, base, ref)
+  const prompt = callersPrompt(plan, ref, candidates, CALLERS_LIMIT, base)
+  const answer = await freshSessionAnswer($, prompt, prompt, base, `Plan Crutches: callers of ${ref.symbol}`)
+  const parsed = answer.text ? parseCallersReply(answer.text, CALLERS_LIMIT, await pathPrefixes($, base)) : null
+  let result: CallersQuery
+  if (parsed) {
+    result = { status: 'ready', callers: parsed.callers, more: parsed.more, source: answer.source }
+  } else {
+    const grouped = groupCandidates(candidates, CALLERS_LIMIT)
+    result = { status: 'ready', callers: grouped.callers, more: grouped.more, source: 'search', ...(answer.failure ? { error: answer.failure } : {}) }
+  }
+  await update($, diagramAtom, state => (state.status === 'ready' ? { ...state, callers: { ...state.callers, [key]: result } } : state))
+  changed($)
+}
+
+async function saveDiagramSvg($: EngineInterface, svg: string): Promise<void> {
   const review = await read($, reviewAtom)
   if (review.isDemo || !review.recordPath) {
-    setNotice('Demo: the SVG is kept with the review only while a real plan has a record file.')
+    setNotice('Demo: the SVG is saved next to the record only for a real plan.')
     changed($)
     return
   }
   const svgPath = `${review.recordPath.replace(/\.md$/, '')}.svg`
   try {
     await $.fs.write(svgPath, svg)
-    await update($, reviewAtom, current => ({ ...current, canvasSvgPath: svgPath }))
+    await update($, reviewAtom, current => ({ ...current, diagramSvgPath: svgPath }))
     setNotice(`SVG saved: ${svgPath}`)
     await writeRecord($)
   } catch (error) {
@@ -959,10 +1146,12 @@ async function handleAction($: EngineInterface, action: WebAction): Promise<void
       return ask($, action.question, action.focus, action.target, action.id)
     case 'askMore':
       return askMore($, action.id, action.question)
-    case 'canvas':
-      return setCanvas($, action.canvas)
-    case 'canvasSvg':
-      return saveCanvasSvg($, action.svg)
+    case 'generateDiagram':
+      return generateDiagram($)
+    case 'callers':
+      return findCallers($, { path: action.path, symbol: action.symbol })
+    case 'diagramSvg':
+      return saveDiagramSvg($, action.svg)
     case 'setLang':
       await update($, uiAtom, ui => ({ ...ui, lang: action.lang }))
       changed($)
@@ -981,12 +1170,22 @@ export const register: Register = (on, rawOptions) => {
       description: 'Plan Crutches: open the plan review page (demo | url | close | stop | reset)',
       argumentHint: '[demo|url|close|stop|reset]',
     })
+    await registerDiagramAgent($)
     const review = await read($, reviewAtom)
     if (review.status === 'idle') await update($, uiAtom, ui => ({ ...ui, lang: options.language }))
     if (review.status === 'reviewing' || review.status === 'revising') {
       void openPane($, false)
       void ensureServer($)
     }
+    return next(e)
+  })
+
+  // The diagram agent is the mod's own: the model never sees it in its listing.
+  on('agent.offer', { agent: 'plan-crutches:diagram' }, async () => ({ isOffered: false })).catch(async () => ({ isOffered: false }))
+
+  // A diagram session's answer is its turn's end; the waiter that spawned it takes it.
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId && agentWaiters.has(e.agentId)) settleAgent(e.agentId, e.reason === 'answer' ? e.answer : undefined)
     return next(e)
   })
 

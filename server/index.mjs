@@ -21,6 +21,7 @@ const PROJECT_DIR = path.resolve(env.PLAN_CRUTCHES_PROJECT || process.cwd())
 const TOKEN = env.PLAN_CRUTCHES_TOKEN || crypto.randomBytes(16).toString('hex')
 const IDLE_MS = Number(env.PLAN_CRUTCHES_IDLE_MS || 0) || 0
 const DEMO_STATE = env.PLAN_CRUTCHES_DEMO || ''
+const DEMO_DIAGRAM = path.join(here, '..', 'fixtures', 'demo-diagram.json')
 const MAX_BODY = 64 * 1024 * 1024
 
 const TYPES = {
@@ -49,12 +50,13 @@ const EMPTY_STATE = {
   comments: [],
   bodies: {},
   qa: [],
-  canvas: { nodes: [], edges: [], strokes: [] },
+  diagram: { status: 'idle', callers: {} },
   files: {},
   lang: 'en',
   summaryLimit: 9000,
   cwd: PROJECT_DIR,
   generatedAt: new Date().toISOString(),
+  protocol: 3,
 }
 
 let state = EMPTY_STATE
@@ -185,12 +187,40 @@ function handleDemoAction(action) {
     case 'setLang':
       state.lang = action.lang === 'uk' ? 'uk' : 'en'
       break
-    case 'canvas':
-      state.canvas = action.canvas
+    case 'diagramSvg':
+      state.review = { ...state.review, diagramSvgPath: '(demo) diagram.svg' }
       break
-    case 'canvasSvg':
-      state.review = { ...state.review, canvasSvgPath: '(demo) diagram.svg' }
+    case 'generateDiagram': {
+      state.diagram = { status: 'loading', callers: {} }
+      setTimeout(() => {
+        try {
+          const demo = JSON.parse(fs.readFileSync(DEMO_DIAGRAM, 'utf8'))
+          state.diagram = { status: 'ready', graph: demo.graph, version: state.review.version, source: 'session', callers: {} }
+        } catch (error) {
+          state.diagram = { status: 'failed', error: String(error), callers: {} }
+        }
+        state.generatedAt = now()
+        broadcast()
+      }, 900)
       break
+    }
+    case 'callers': {
+      const key = `${action.path}#${action.symbol}`
+      const diagram = state.diagram || { status: 'idle', callers: {} }
+      state.diagram = { ...diagram, callers: { ...diagram.callers, [key]: { status: 'loading', callers: [], more: 0 } } }
+      setTimeout(() => {
+        let found = { callers: [], more: 0 }
+        try {
+          found = JSON.parse(fs.readFileSync(DEMO_DIAGRAM, 'utf8')).callers[key] || found
+        } catch {
+          // keep the empty answer
+        }
+        state.diagram = { ...state.diagram, callers: { ...state.diagram.callers, [key]: { status: 'ready', ...found, source: 'session' } } }
+        state.generatedAt = now()
+        broadcast()
+      }, 800)
+      break
+    }
     case 'generateBody': {
       const key = `${action.path}#${action.symbol}`
       state.bodies = { ...state.bodies, [key]: { status: 'loading' } }
