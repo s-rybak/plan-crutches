@@ -163,6 +163,33 @@ export type Diagram = {
 
 export type FileCache = Record<string, string | null>
 
+/**
+ * A live review as the plugin store keeps it, keyed by the project folder, so
+ * a later process in the same folder can take it up again. `shape` names the
+ * layout of this record; a record of another shape is ignored.
+ */
+export type StoredReview = {
+  shape: number
+  cwd: string
+  /** The session that wrote it; the same session resumed restores it on its own. */
+  sessionId: string
+  savedAt: string
+  plan: PlanModel
+  review: Review
+  comments: ReviewComment[]
+  qa: QaItem[]
+  diagram: Diagram
+  task: TaskCapture
+  ui: UiState
+  /** The generated bodies, kept only while the whole record stays small. */
+  bodies?: Record<string, GeneratedBody>
+  /** The page token, so the token the page kept stays valid after a restart. */
+  token?: string
+}
+
+/** One row of the store's index: a folder with a stored review, newest first. */
+export type StoredIndexEntry = { cwd: string; savedAt: string; title: string; version: number }
+
 /** The review page server as the mod knows it; the token outlives restarts. */
 export type WebState = {
   token?: string

@@ -7,9 +7,11 @@ Plan Crutches is a mod for Claude Code. It shows Claude's plan in a review page 
 1. You start plan mode and give Claude a task.
 2. Claude writes the plan file as usual and ends it with a `plan-crutches` JSON block. The mod adds this instruction to the plan mode reminder.
 3. When Claude calls `ExitPlanMode`, the mod reads the plan file, starts the review page server, opens the page and tells Claude to wait.
-4. You review in the page. Every comment is saved in the session state and in a Markdown record under `docs/plans/`.
+4. You review in the page. Every comment is saved in the session state and in a Markdown record under `docs/plans/`. The mod also keeps the review in its own store, per project folder. If Claude Code restarts and you resume the session, the review comes back on its own. If you start a new session in the same folder, `/plan-review restore` brings it back.
 5. Submit sends your comments to Claude as the next message. Claude updates the plan file and calls `ExitPlanMode` again. The page shows version 2 and marks your comments as resolved.
 6. Submit with no pending comments approves the plan. Claude Code then shows its own plan dialog once. Press Yes there to start the implementation.
+
+A plan can also come from a file. `/plan-review open <path>` reads a Markdown plan file and starts the same review. The page, the pane, the record under `docs/plans/` and the store all work as for a plan from plan mode. The path is absolute or relative to the project folder, and `~` stands for your home folder. Use it for a plan from an earlier session under `~/.claude/plans/`, or for a plan you wrote by hand. If the file is already under review, the command opens it as the next version, and your comments stay. If another plan is under review, the command resets that review first. If you give no path, the mod finds the plan itself. It takes the plan file of this session: the file plan mode names, or the file the review already holds. If there is none, it takes the newest `.md` file under `~/.claude/plans/`. The reply names the file it chose and why.
 
 ## The review page
 
@@ -37,7 +39,9 @@ The page reads its colors from CSS variables in `web/theme.css`, with light and 
 | --- | --- |
 | `/plan-review` | If the page server is not running, starts it. Opens the page and the pane. |
 | `/plan-review demo` | Loads a demo plan so you can try the page without plan mode. |
+| `/plan-review open [path]` | Opens a plan file for review without plan mode. With no path, it opens the plan file of this session, or else the newest file under `~/.claude/plans/`. The same file under review gets the next version and keeps the comments. The command resets any other live review first. |
 | `/plan-review url` | Prints the page address with its token. |
+| `/plan-review restore` | Brings back the stored review of this folder: the plan, the comments, the questions and the diagram. |
 | `/plan-review close` | Closes the pane. The page keeps running. |
 | `/plan-review stop` | Stops the page server. |
 | `/plan-review reset` | Clears the review state. |
@@ -118,4 +122,6 @@ The first two need Claude Code 2.1.275 or newer. The last one checks the page se
 - Claude must write the `plan-crutches` block for the structured view. Without it, the mod asks the model to extract the structure, and falls back to the Markdown alone.
 - The page server runs only where the session runs, so a session in the cloud has the pane alone.
 - A session keeps the mod it loaded at its start. After an update of the mod, start a new session. If the page is newer than the mod of its session, the page shows a warning.
+- A stored review needs its plan file. If the plan file under `~/.claude/plans/` is gone, the review cannot come back. The store keeps the reviews of the last 8 folders. When you approve the plan, reset the review or leave plan mode, the mod drops the stored review of the folder.
+- A plan opened from a file has no plan mode session behind it. After Submit with comments, the revision request asks Claude to update the plan file and call `ExitPlanMode`. If the new version does not appear, run `/plan-review open` again.
 - The diagram shows calls as the clean session read them. It is a reading of the code, not a compiler's analysis.

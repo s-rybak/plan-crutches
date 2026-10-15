@@ -16,6 +16,7 @@ import type {
   QaItem,
   Review,
   ReviewComment,
+  StoredReview,
   TaskCapture,
   UiState,
   WebNotice,
@@ -66,7 +67,10 @@ import {
 } from './prompts'
 import type { RelatedFile } from './prompts'
 import { t } from './i18n'
+import { newestPlanFile, openArgument, planSourceNote, resolvePlanPath } from './open-plan'
+import type { FoundPlan } from './open-plan'
 import { recordFileName, renderRecord } from './record'
+import { STORE_INDEX_KEY, STORE_KEEP, buildStored, indexWith, indexWithout, isRestorable, parseIndex, parseStored, storeKey, thawStored } from './persist'
 import { PANE_ID, bodyKey, newId } from './state'
 import { buildSnapshot, openCommands, pageUrl, parseAction, parseServerLine, parseTarget, splitLines } from './web'
 import type { WebAction } from './web'
@@ -436,6 +440,129 @@ async function pushState($: EngineInterface): Promise<void> {
 
 function changed($: EngineInterface): void {
   void pushState($)
+  syncStore($)
+}
+
+// ---- the review between processes ------------------------------------------
+// The session state dies with the process. A live review is also written to
+// the plugin store, keyed by the project folder: the same session resumed
+// takes it up on its own, another session in the folder by /plan-review restore.
+// The store work runs one job at a time, in the order it was asked.
+
+let storeChain: Promise<void> = Promise.resolve()
+let syncQueued = false
+
+async function sessionCwd($: EngineInterface): Promise<string> {
+  try {
+    return await $.session.cwd()
+  } catch {
+    return ''
+  }
+}
+
+async function currentSessionId($: EngineInterface): Promise<string> {
+  try {
+    return await $.session.id()
+  } catch {
+    return ''
+  }
+}
+
+/** Writes the review to the store after the running job; one write serves every call made meanwhile. */
+function syncStore($: EngineInterface): void {
+  if (syncQueued) return
+  syncQueued = true
+  storeChain = storeChain.then(() => syncJob($))
+}
+
+async function syncJob($: EngineInterface): Promise<void> {
+  syncQueued = false
+  try {
+    await writeStore($)
+  } catch (error) {
+    $.ui.log(`plan-crutches: could not write the review to the store: ${String(error)}`, { to: 'debug' })
+  }
+}
+
+async function writeStore($: EngineInterface): Promise<void> {
+  const [plan, review, comments, qa, diagram, task, ui, bodies, web] = await Promise.all([
+    read($, planAtom),
+    read($, reviewAtom),
+    read($, commentsAtom),
+    read($, qaAtom),
+    read($, diagramAtom),
+    read($, taskAtom),
+    read($, uiAtom),
+    read($, bodiesAtom),
+    read($, webAtom),
+  ])
+  if (!plan || review.isDemo || !isRestorable(review)) return
+  const cwd = await sessionCwd($)
+  if (!cwd) return
+  const savedAt = await isoNow($)
+  const sessionId = await currentSessionId($)
+  const stored = buildStored({ cwd, sessionId, savedAt, plan, review, comments, qa, diagram, task, ui, bodies, ...(web.token ? { token: web.token } : {}) })
+  const index = indexWith(parseIndex(await $.store.get(STORE_INDEX_KEY)), { cwd, savedAt, title: plan.title, version: review.version }, STORE_KEEP)
+  for (const dropped of index.dropped) await $.store.delete(storeKey(dropped))
+  await $.store.set(storeKey(cwd), stored)
+  await $.store.set(STORE_INDEX_KEY, index.entries)
+}
+
+/** Drops this folder's stored review after the running job: the review ended or was reset. */
+function clearStore($: EngineInterface): Promise<void> {
+  storeChain = storeChain.then(() => deleteStore($))
+  return storeChain
+}
+
+async function deleteStore($: EngineInterface): Promise<void> {
+  try {
+    const cwd = await sessionCwd($)
+    if (!cwd) return
+    const key = storeKey(cwd)
+    if ((await $.store.keys()).includes(key)) await $.store.delete(key)
+    const index = parseIndex(await $.store.get(STORE_INDEX_KEY))
+    if (index.some(entry => entry.cwd === cwd)) await $.store.set(STORE_INDEX_KEY, indexWithout(index, cwd))
+  } catch (error) {
+    $.ui.log(`plan-crutches: could not drop the stored review: ${String(error)}`, { to: 'debug' })
+  }
+}
+
+/** This folder's stored review, when the store holds one this code can read. */
+async function readStored($: EngineInterface): Promise<StoredReview | null> {
+  try {
+    const cwd = await sessionCwd($)
+    if (!cwd) return null
+    const stored = parseStored(await $.store.get(storeKey(cwd)))
+    return stored && isRestorable(stored.review) ? stored : null
+  } catch (error) {
+    $.ui.log(`plan-crutches: could not read the stored review: ${String(error)}`, { to: 'debug' })
+    return null
+  }
+}
+
+/** Takes a stored review up in this process; `gone` when its plan file is no longer there. */
+async function restoreReview($: EngineInterface, stored: StoredReview): Promise<'restored' | 'gone'> {
+  const planFilePath = stored.review.planFilePath
+  if (!planFilePath || !(await $.fs.exists(planFilePath))) return 'gone'
+  const now = await isoNow($)
+  const thawed = thawStored(stored)
+  await update($, planAtom, () => thawed.plan)
+  await update($, reviewAtom, () => ({ ...thawed.review, history: [...thawed.review.history, `restored after a restart ${now}`] }))
+  await update($, commentsAtom, () => thawed.comments)
+  await update($, qaAtom, () => thawed.qa)
+  await update($, diagramAtom, () => thawed.diagram)
+  await update($, taskAtom, () => thawed.task)
+  await update($, uiAtom, () => thawed.ui)
+  await update($, bodiesAtom, () => thawed.bodies)
+  await update($, filesAtom, () => ({}))
+  // The stored token lets the page the person left open reconnect; a server
+  // already running keeps the token it was started with.
+  const token = stored.token
+  if (token && !server) await update($, webAtom, web => ({ ...web, token }))
+  notice = undefined
+  await writeRecord($)
+  changed($)
+  return 'restored'
 }
 
 async function openWeb($: EngineInterface, open: boolean): Promise<string | undefined> {
@@ -480,6 +607,7 @@ async function resetAll($: EngineInterface): Promise<void> {
   await update($, filesAtom, () => ({}))
   await update($, taskAtom, () => ({}))
   await update($, uiAtom, freshUi)
+  await clearStore($)
   notice = undefined
   changed($)
 }
@@ -493,11 +621,19 @@ async function findLatestPlanFile($: EngineInterface): Promise<string | undefine
   if (!home) return undefined
   const dir = `${home}/.claude/plans`
   if (!(await $.fs.exists(dir))) return undefined
-  const entries = await $.fs.list(dir)
-  const newest = entries
-    .filter(entry => entry.kind === 'file' && entry.name.endsWith('.md'))
-    .sort((a, b) => b.mtimeMs - a.mtimeMs)[0]
-  return newest ? `${dir}/${newest.name}` : undefined
+  return newestPlanFile(dir, await $.fs.list(dir))
+}
+
+/**
+ * The plan to open when the person names none: the file this session already
+ * knows (from plan mode, an earlier open or a restore), while it is still on
+ * disk, else the newest plan file under `~/.claude/plans`.
+ */
+async function findPlanFile($: EngineInterface): Promise<FoundPlan | undefined> {
+  const review = await read($, reviewAtom)
+  if (review.planFilePath && (await $.fs.exists(review.planFilePath).catch(() => false))) return { path: review.planFilePath, source: 'review' }
+  const newest = await findLatestPlanFile($).catch(() => undefined)
+  return newest ? { path: newest, source: 'newest' } : undefined
 }
 
 function applyTask(plan: PlanModel, task: TaskCapture): void {
@@ -614,6 +750,41 @@ async function receivePlan($: EngineInterface, markdown: string, planFilePath: s
   await writeRecord($)
   changed($)
   return version
+}
+
+/**
+ * Reviews a plan file without plan mode, the way an ExitPlanMode call is
+ * reviewed: the file at `given`, or, with no path, the one `findPlanFile`
+ * picks. The file already under review gets its next version, so the
+ * comments stay; any other live review is reset first.
+ */
+async function openPlanFile($: EngineInterface, given: string): Promise<string> {
+  let planFilePath: string
+  let note = ''
+  if (given) {
+    planFilePath = resolvePlanPath(given, await sessionCwd($), (await $.env.get('HOME')) ?? '')
+    const exists = await $.fs.exists(planFilePath).catch(() => false)
+    if (!exists) return `Plan Crutches: no file at ${planFilePath}.`
+  } else {
+    const found = await findPlanFile($)
+    if (!found) return 'Plan Crutches: no plan found: this session has no plan file and ~/.claude/plans holds none. Name one: /plan-review open <path>.'
+    planFilePath = found.path
+    note = `, ${planSourceNote(found.source)}`
+  }
+  let markdown: string
+  try {
+    markdown = await $.fs.read(planFilePath)
+  } catch (error) {
+    return `Plan Crutches: could not read ${planFilePath}: ${String(error)}`
+  }
+  if (!markdown.trim()) return `Plan Crutches: ${planFilePath} is empty.`
+  const review = await read($, reviewAtom)
+  const sameFile = !review.isDemo && isRestorable(review) && review.planFilePath === planFilePath
+  if (!sameFile) await resetAll($)
+  const version = await receivePlan($, markdown, planFilePath, false)
+  const url = await openWeb($, true)
+  await openPane($, true)
+  return `Plan Crutches: plan v${version} opened from ${planFilePath}${note}.${url ? ` Page: ${url}` : ''}`
 }
 
 async function submit($: EngineInterface): Promise<void> {
@@ -1167,11 +1338,24 @@ export const register: Register = (on, rawOptions) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'plan-review',
-      description: 'Plan Crutches: open the plan review page (demo | url | close | stop | reset)',
-      argumentHint: '[demo|url|close|stop|reset]',
+      description: 'Plan Crutches: open the plan review page (demo | open [plan file] | url | restore | close | stop | reset)',
+      argumentHint: '[demo|open [plan file]|url|restore|close|stop|reset]',
     })
     await registerDiagramAgent($)
-    const review = await read($, reviewAtom)
+    let review = await read($, reviewAtom)
+    if (review.status === 'idle') {
+      // A new process: the session state is empty. The same session resumed
+      // takes its stored review up; another session is told it is there.
+      const stored = await readStored($)
+      if (stored && stored.sessionId === (await currentSessionId($))) {
+        if ((await restoreReview($, stored)) === 'restored') {
+          review = await read($, reviewAtom)
+          $.ui.toast(`Plan Crutches: plan v${review.version} restored after the restart; /plan-review opens the page.`)
+        }
+      } else if (stored) {
+        $.ui.toast(`Plan Crutches: an unfinished review of "${stored.plan.title}" (v${stored.review.version}) is stored for this folder; /plan-review restore brings it back.`)
+      }
+    }
     if (review.status === 'idle') await update($, uiAtom, ui => ({ ...ui, lang: options.language }))
     if (review.status === 'reviewing' || review.status === 'revising') {
       void openPane($, false)
@@ -1190,6 +1374,9 @@ export const register: Register = (on, rawOptions) => {
   })
 
   on('command.run', { command: 'plan-review' }, async ($, e) => {
+    // The path of `open` keeps its case; every other form is one keyword.
+    const open = openArgument(e.args)
+    if (open.isOpen) return { text: await openPlanFile($, open.path) }
     const arg = e.args.trim().toLowerCase()
     if (arg === 'close') {
       await $.ui.close({ id: PANE_ID })
@@ -1207,6 +1394,16 @@ export const register: Register = (on, rawOptions) => {
     if (arg === 'url') {
       const url = await openWeb($, false)
       return { text: url ? `Plan Crutches review page: ${url}` : 'The review page is not running; see the debug log.' }
+    }
+    if (arg === 'restore') {
+      const review = await read($, reviewAtom)
+      if (review.status === 'reviewing' || review.status === 'revising') return { text: `Plan v${review.version} is already under review in this session.` }
+      const stored = await readStored($)
+      if (!stored) return { text: 'No stored review for this folder.' }
+      if ((await restoreReview($, stored)) === 'gone') return { text: `The stored review cannot come back: its plan file is gone (${stored.review.planFilePath ?? 'no path'}).` }
+      const url = await openWeb($, true)
+      await openPane($, true)
+      return { text: `Plan Crutches: plan v${stored.review.version} restored.${url ? ` Page: ${url}` : ''}` }
     }
     if (arg === 'demo') {
       await resetAll($)
@@ -1268,6 +1465,7 @@ export const register: Register = (on, rawOptions) => {
     if (review.status === 'reviewing' || review.status === 'revising') {
       const now = await isoNow($)
       await update($, reviewAtom, current => ({ ...current, status: 'idle' as const, history: [...current.history, `plan mode left ${now}`] }))
+      await clearStore($)
       await writeRecord($)
       changed($)
     }
@@ -1284,6 +1482,7 @@ export const register: Register = (on, rawOptions) => {
         await update($, reviewAtom, current => ({ ...current, status: 'reviewing' as const, history: [...current.history, `approval not confirmed ${now}`] }))
       } else {
         await update($, reviewAtom, current => ({ ...current, history: [...current.history, `plan mode exited for implementation ${now}`] }))
+        await clearStore($)
       }
       await writeRecord($)
       changed($)
