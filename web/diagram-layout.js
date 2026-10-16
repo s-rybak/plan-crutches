@@ -3,17 +3,22 @@
 // direction (callers left, callees right), one row per symbol, and every edge
 // between rows. The callers of an opened symbol come as rows of the planned
 // blocks or as blocks of their own in a lane left of the callee; callers past
-// the limit are one "others" block. Pure: the renderer draws it on the 3D
-// plane, the SVG export draws it flat.
+// the limit are one "others" block. A block the user dragged keeps the place
+// it was dropped at; the board grows to hold it, while the view keeps turning
+// around the center of the automatic layout (the pivot). Pure: the renderer
+// draws it on the 3D plane, the SVG export draws it flat.
 
 export const BLOCK_W = 250
-export const HEAD_H = 38
+export const HEAD_H = 46
 export const ROW_H = 24
 export const PAD = 6
 export const NOTE_H = 26
 export const COL_GAP = 120
+export const WRAP_GAP = 36
 export const ROW_GAP = 34
 export const MARGIN = 48
+/** A column taller than this wraps into a second stack beside the first. */
+export const MAX_STACK = 1200
 
 export const rowKey = (path, symbol) => `${path}#${symbol}`
 
@@ -90,11 +95,31 @@ function orderColumns(columns, links) {
   })
 }
 
+/** A column split into stacks of at most MAX_STACK height, in order; a block taller than that is a stack of its own. */
+export function wrapColumn(column) {
+  const stacks = []
+  let stack = []
+  let height = 0
+  for (const block of column) {
+    const next = height + (stack.length ? ROW_GAP : 0) + block.h
+    if (stack.length && next > MAX_STACK) {
+      stacks.push(stack)
+      stack = []
+      height = 0
+    }
+    stack.push(block)
+    height += (stack.length > 1 ? ROW_GAP : 0) + block.h
+  }
+  if (stack.length) stacks.push(stack)
+  return stacks
+}
+
 /**
  * Lays out the scene. `graph` is the generated graph, `callers` the queries by
- * `path#symbol`, `expanded` the set of keys whose callers are shown.
+ * `path#symbol`, `expanded` the set of keys whose callers are shown, `moved`
+ * the positions of the blocks the user dragged, by block id.
  */
-export function layoutScene(graph, callers = {}, expanded = new Set()) {
+export function layoutScene(graph, callers = {}, expanded = new Set(), moved = new Map()) {
   const files = (graph && graph.files) || []
   const planned = new Map()
   for (const file of files) {
@@ -177,13 +202,17 @@ export function layoutScene(graph, callers = {}, expanded = new Set()) {
   for (const block of blocks) {
     block.w = BLOCK_W
     block.h = blockHeight(block)
+    block.moved = false
   }
-  // planned columns first: top-aligned stacks
-  for (const column of columns) {
-    let y = MARGIN
-    for (const block of column) {
-      block.y = y
-      y += block.h + ROW_GAP
+  // planned columns first: top-aligned stacks, a tall column wrapped into several
+  const stacksOf = columns.map(column => wrapColumn(column))
+  for (const stacks of stacksOf) {
+    for (const stack of stacks) {
+      let y = MARGIN
+      for (const block of stack) {
+        block.y = y
+        y += block.h + ROW_GAP
+      }
     }
   }
   const rowCenter = (block, index) => (block.kind === 'others' ? block.y + HEAD_H / 2 : block.y + HEAD_H + PAD + index * ROW_H + ROW_H / 2)
@@ -206,7 +235,7 @@ export function layoutScene(graph, callers = {}, expanded = new Set()) {
       y = block.y + block.h + ROW_GAP
     }
   }
-  // x positions: lane k, then column k
+  // x positions: lane k, then the stacks of column k
   let x = MARGIN
   const count = Math.max(columns.length, lanes.length)
   for (let k = 0; k < count; k += 1) {
@@ -214,10 +243,27 @@ export function layoutScene(graph, callers = {}, expanded = new Set()) {
       for (const block of lanes[k]) block.x = x
       x += BLOCK_W + COL_GAP
     }
-    if (columns[k] && columns[k].length) {
-      for (const block of columns[k]) block.x = x
-      x += BLOCK_W + COL_GAP
-    }
+    const stacks = stacksOf[k] || []
+    stacks.forEach((stack, index) => {
+      for (const block of stack) block.x = x
+      x += BLOCK_W + (index < stacks.length - 1 ? WRAP_GAP : COL_GAP)
+    })
+  }
+
+  // the board of the automatic layout: its center is the pivot the view turns around
+  let baseWidth = MARGIN * 2
+  let baseHeight = MARGIN * 2
+  for (const block of blocks) {
+    baseWidth = Math.max(baseWidth, block.x + block.w + MARGIN)
+    baseHeight = Math.max(baseHeight, block.y + block.h + MARGIN)
+  }
+  // the blocks the user dragged stay where they were dropped
+  for (const block of blocks) {
+    const place = moved.get(block.id)
+    if (!place) continue
+    block.x = place.x
+    block.y = place.y
+    block.moved = true
   }
 
   const edges = []
@@ -250,13 +296,14 @@ export function layoutScene(graph, callers = {}, expanded = new Set()) {
     edges.push({ id: edge.id, from: edge.from, to: edge.to, kind: edge.kind, origin: edge.origin, mode, x1, y1: ya, x2, y2: yb })
   }
 
-  let width = MARGIN * 2
-  let height = MARGIN * 2
+  // the board grows right and down to hold every moved block (positions never go below zero)
+  let width = baseWidth
+  let height = baseHeight
   for (const block of blocks) {
     width = Math.max(width, block.x + block.w + MARGIN)
     height = Math.max(height, block.y + block.h + MARGIN)
   }
-  return { blocks, edges, rows: rowIndex, width, height }
+  return { blocks, edges, rows: rowIndex, width, height, pivot: { x: baseWidth / 2, y: baseHeight / 2 } }
 }
 
 /** The SVG path of an edge, by how its ends face each other. */

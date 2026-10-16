@@ -36,6 +36,7 @@ import {
   groupCandidates,
   isDeclarationOf,
   isImportLine,
+  isTestPath,
   loadingCallers,
   parseCallersReply,
   parseDiagramReply,
@@ -1175,7 +1176,7 @@ async function generateDiagram($: EngineInterface): Promise<void> {
   const base = await projectBase($)
   const texts: Record<string, string | null> = {}
   for (const file of plan.files) {
-    if (file.status !== 'new') texts[file.path] = await readProjectFile($, base, file.path)
+    if (file.status !== 'new' && !isTestPath(file.path)) texts[file.path] = await readProjectFile($, base, file.path)
   }
   const answer = await freshSessionAnswer($, diagramPrompt(plan, texts, { tools: true }), diagramPrompt(plan, texts, { tools: false }), base, 'Plan Crutches: change diagram')
   const graph = answer.text ? parseDiagramReply(answer.text, plan) : null
@@ -1213,6 +1214,7 @@ async function searchCallers($: EngineInterface, base: string, ref: DiagramRef):
   const lines = new Map<string, string[] | null>()
   const candidates: CallerCandidate[] = []
   for (const hit of hits) {
+    if (isTestPath(hit.path)) continue
     if (hit.path === ref.path && isDeclarationOf(hit.text, needle)) continue
     if (isImportLine(hit.text)) continue
     if (!lines.has(hit.path)) {

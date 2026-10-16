@@ -175,3 +175,38 @@ test('diagram layout: callees sit right of callers, callers of an opened symbol 
   assert.equal(opened.blocks.filter(block => block.id.startsWith('others:')).length, 1, 'a loading query adds nothing yet')
   assert.ok(opened.width > plain.width, 'the lane widens the scene')
 })
+
+test('diagram layout: a dragged block keeps its place, the board grows and the pivot stays; tall columns wrap', async () => {
+  const { layoutScene, wrapColumn, rowKey, BLOCK_W, MARGIN, MAX_STACK, ROW_GAP } = await import('../web/diagram-layout.js')
+  const { readFileSync } = await import('node:fs')
+  const demo = JSON.parse(readFileSync(new URL('../fixtures/demo-diagram.json', import.meta.url), 'utf8'))
+  const plain = layoutScene(demo.graph, {}, new Set())
+  assert.deepEqual(plain.pivot, { x: plain.width / 2, y: plain.height / 2 })
+  assert.ok(plain.blocks.every(block => !block.moved))
+
+  const moved = new Map([
+    ['file:docs/auth.md', { x: 1400, y: 900 }],
+    ['file:src/auth/user.ts', { x: 1200, y: 60 }],
+  ])
+  const dragged = layoutScene(demo.graph, {}, new Set(), moved)
+  const byPath = new Map(dragged.blocks.map(block => [block.path, block]))
+  assert.deepEqual([byPath.get('docs/auth.md').x, byPath.get('docs/auth.md').y, byPath.get('docs/auth.md').moved], [1400, 900, true])
+  assert.deepEqual(dragged.pivot, plain.pivot, 'the view keeps turning around the automatic layout')
+  assert.equal(dragged.width, 1400 + BLOCK_W + MARGIN)
+  assert.equal(dragged.height, 900 + byPath.get('docs/auth.md').h + MARGIN)
+  assert.equal(byPath.get('src/auth/session.ts').x, new Map(plain.blocks.map(block => [block.path, block])).get('src/auth/session.ts').x, 'other blocks stay put')
+  const edge = dragged.edges.find(one => one.from === rowKey('src/auth/user.ts', 'getCurrentUser') && one.to === rowKey('src/auth/session.ts', 'refreshSession'))
+  assert.equal(edge.mode, 'backward', 'the edge follows the moved block')
+  assert.equal(edge.x1, 1200)
+
+  const tall = Array.from({ length: 5 }, (_, index) => ({ id: `b${index}`, h: 500 }))
+  const stacks = wrapColumn(tall)
+  assert.deepEqual(stacks.map(stack => stack.length), [2, 2, 1])
+  assert.ok(2 * 500 + ROW_GAP <= MAX_STACK && 3 * 500 + 2 * ROW_GAP > MAX_STACK)
+  const files = Array.from({ length: 12 }, (_, index) => ({ path: `src/f${index}.ts`, status: 'modified', symbols: Array.from({ length: 12 }, (_, at) => ({ name: `s${at}`, kind: 'function' })) }))
+  const wide = layoutScene({ files, edges: [] }, {}, new Set())
+  const xs = new Set(wide.blocks.map(block => block.x))
+  assert.ok(xs.size > 1, 'a column of twelve tall blocks wraps into several stacks')
+  assert.ok(wide.height <= MAX_STACK + 2 * MARGIN + 1)
+  assert.equal(wide.blocks.length, 12, 'every block is drawn')
+})

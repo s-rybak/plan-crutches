@@ -10,6 +10,7 @@ import {
   groupCandidates,
   isDeclarationOf,
   isImportLine,
+  isTestPath,
   normalizeGraph,
   parseCallersReply,
   parseDiagramReply,
@@ -111,6 +112,35 @@ describe('diagram answers', () => {
     expect(prefixed?.callers.map(one => one.path)).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts'])
     expect(callersPrompt(demoPlan(), { path: 'x.ts', symbol: 'f' }, [], 20, '/repo/app')).toContain('relative to the project folder /repo/app')
     expect(parseCallersReply('{"callers": [{"path":"a.ts","symbol":"f"}], "total": 0}')?.more).toBe(0)
+  })
+
+  test('test files stay out of the graph and of the callers, and the plan has no caps', async () => {
+    for (const path of ['tests/a.ts', 'src/__tests__/x.js', 'src/a.test.ts', 'src/a.spec.tsx', 'pkg/a_test.go', 'src/test_utils.py', 'fixtures/demo.json', 'src/FooTest.java', 'features/login.feature', './spec/models/user_spec.rb']) {
+      expect(isTestPath(path)).toBe(true)
+    }
+    for (const path of ['src/contest.ts', 'src/latest/a.ts', 'src/auth/attest.ts', 'src/Testing.java', 'tests_helper/x.py', 'src/testdata.ts']) {
+      expect(isTestPath(path)).toBe(false)
+    }
+    const plan = demoPlan()
+    const first = plan.files[0]!
+    const withTest = { ...plan, files: [...plan.files, { ...first, path: 'tests/session.test.ts', status: 'new' as const }] }
+    const many = Array.from({ length: 45 }, (_, index) => ({ name: `export${index}`, kind: 'function' }))
+    const graph = normalizeGraph({ files: [{ path: 'src/legacy/tokens.ts', symbols: many }], edges: [] }, withTest)
+    expect(graph.files.map(file => file.path)).toEqual(plan.files.map(file => file.path))
+    expect(graph.files.find(file => file.path === 'src/legacy/tokens.ts')?.symbols.length).toBe(45)
+    expect(diagramPrompt(plan, {}, { tools: true })).toContain('Skip test files')
+    expect(callersPrompt(plan, { path: 'x.ts', symbol: 'f' }, [])).toContain('Skip uses in test files')
+
+    const reply = '{"callers":[{"path":"tests/a.test.ts","symbol":"t"},{"path":"src/b.ts","symbol":"g"},{"path":"src/__tests__/c.ts","symbol":"(module)"}],"total":5}'
+    const parsed = parseCallersReply(reply)
+    expect(parsed?.callers).toEqual([{ path: 'src/b.ts', symbol: 'g', kind: 'other' }])
+    expect(parsed?.more).toBe(2)
+    const grouped = groupCandidates([
+      { path: 'src/a.spec.ts', line: 3, text: 'x', enclosing: 'f', kind: 'function' },
+      { path: 'src/a.ts', line: 3, text: 'x', enclosing: 'f', kind: 'function' },
+    ])
+    expect(grouped.callers.map(one => one.path)).toEqual(['src/a.ts'])
+    expect(grouped.more).toBe(0)
   })
 
   test('the record text lists files and calls', async () => {

@@ -9,8 +9,10 @@ import { planSurface } from './prompts'
 export const CALLERS_LIMIT = 20
 /** How many text-search hits go to the session as candidates. */
 export const CANDIDATE_LIMIT = 150
+/** How much of the plan the graph question carries: the whole plan, within reason. */
+const PLAN_TEXT_LIMIT = 120000
 const FILE_TEXT_LIMIT = 16000
-const FILES_TEXT_LIMIT = 90000
+const FILES_TEXT_LIMIT = 150000
 const KINDS: readonly SymbolKind[] = ['function', 'method', 'class', 'type', 'const', 'other']
 
 export const DIAGRAM_AGENT_NAME = 'diagram'
@@ -42,6 +44,18 @@ const CALLERS_SHAPE = `{
   "total": 3
 }`
 
+/**
+ * Test files and folders (tests/, __tests__/, spec/, e2e/, fixtures/, *.test.*,
+ * *.spec.*, *_test.go, test_*.py, *Test.java …) stay out of the diagram: not as
+ * blocks of the plan, not as callers.
+ */
+const TEST_PATH =
+  /(^|\/)(tests?|__tests__|specs?|e2e|cypress|__mocks__|__snapshots__|testdata|fixtures)(\/|$)|(^|\/)(test_[^/]*\.py|conftest\.py)$|[._-](test|spec|tests|specs)\.[a-z0-9]+$|_test\.(go|rs|py|rb|ex|exs|c|cc|cpp)$|(Test|Tests|Spec|IT)\.(java|kt|kts|cs|php|scala|swift|groovy)$|\.feature$/i
+
+export function isTestPath(path: string): boolean {
+  return TEST_PATH.test(normalizePath(path))
+}
+
 function cut(text: string, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit)}\n… (cut, ${text.length - limit} more characters)` : text
 }
@@ -70,7 +84,7 @@ function filesText(texts: Readonly<Record<string, string | null>>): string {
 export function diagramPrompt(plan: PlanModel, texts: Readonly<Record<string, string | null>>, options: { tools: boolean }): string {
   const parts = [
     'Build the call graph of the implementation plan below for an architecture diagram.',
-    planSurface(plan),
+    planSurface(plan, PLAN_TEXT_LIMIT),
   ]
   const existing = filesText(texts)
   if (existing) parts.push(existing)
@@ -78,6 +92,7 @@ export function diagramPrompt(plan: PlanModel, texts: Readonly<Record<string, st
     `Answer with JSON of exactly this shape:\n${GRAPH_SHAPE}\n\n` +
       'Rules:\n' +
       '- List every planned file with every planned symbol (same paths and names as the plan). For a deleted file, list the symbols it exports today, since other code may still use them.\n' +
+      '- Skip test files and test folders (tests/, __tests__/, spec/, *.test.*, *.spec.*, fixtures): the diagram shows the production code only.\n' +
       '- An edge from A to B means A calls B (kind "call") or A uses B as a type or a constant (kind "use"). Include edges between symbols of the same file.\n' +
       '- Only edges between symbols listed in this answer. Use the plan descriptions and signatures' +
       (options.tools ? ', and read the project files to confirm calls that exist in the current code.' : ' and the file texts given above.') +
@@ -109,6 +124,7 @@ export function callersPrompt(plan: PlanModel, ref: DiagramRef, candidates: read
       `- One entry per enclosing symbol (the function, method, class or constant whose body holds the use); "(module)" for a use at module level. At most ${limit} entries, the most important first.\n` +
       '- Drop false positives: the declaration itself, comments, strings, and other symbols that only share the name. An import line alone is no caller: name the function that uses the symbol. A re-export counts, as "(module)".\n' +
       '- Add callers the text search missed (re-exports, calls through an interface, other spellings).\n' +
+      '- Skip uses in test files and test folders (tests/, __tests__/, spec/, *.test.*, *.spec.*, fixtures): they are not callers for this diagram.\n' +
       '- "total" is the number of distinct callers you found, including the ones beyond the limit.\n' +
       (root ? `- Write every path relative to the project folder ${root}, as the plan writes them.\n` : '') +
       '- No prose, no code fence: the JSON object only.',
@@ -143,8 +159,9 @@ function readRef(raw: unknown): DiagramRef | null {
 /**
  * Turns the session's answer into the graph the page draws. The plan decides
  * the blocks and their rows: every planned file with every planned symbol,
- * whatever the answer forgot; a deleted file takes the exports the answer
- * found. Edges stay only between rows that exist.
+ * whatever the answer forgot, without a cap; a deleted file takes the exports
+ * the answer found. Test files stay out. Edges stay only between rows that
+ * exist.
  */
 export function normalizeGraph(raw: unknown, plan: PlanModel): DiagramGraph {
   const answered = new Map<string, Record<string, unknown>>()
@@ -157,12 +174,13 @@ export function normalizeGraph(raw: unknown, plan: PlanModel): DiagramGraph {
   }
   const files: DiagramFile[] = []
   for (const planned of plan.files) {
+    if (isTestPath(planned.path)) continue
     const symbols: DiagramSymbol[] = planned.symbols.map(symbol => ({ name: symbol.name, kind: symbol.kind }))
     if (symbols.length === 0) {
       const found = answered.get(planned.path)
       if (found && Array.isArray(found.symbols)) {
         const seen = new Set<string>()
-        for (const item of found.symbols.slice(0, 40)) {
+        for (const item of found.symbols) {
           if (!isRecord(item)) continue
           const name = asString(item.name)
           if (!name || seen.has(name)) continue
@@ -178,7 +196,7 @@ export function normalizeGraph(raw: unknown, plan: PlanModel): DiagramGraph {
   const edges: DiagramEdge[] = []
   const seenEdges = new Set<string>()
   if (isRecord(raw) && Array.isArray(raw.edges)) {
-    for (const item of raw.edges.slice(0, 2000)) {
+    for (const item of raw.edges) {
       if (!isRecord(item)) continue
       const from = readRef(item.from)
       const to = readRef(item.to)
@@ -202,7 +220,7 @@ export function parseDiagramReply(text: string, plan: PlanModel): DiagramGraph |
   }
 }
 
-/** The callers in a session's reply, capped, their paths made relative to the project; null when the reply holds no JSON object. */
+/** The callers in a session's reply, capped, their paths made relative to the project, test files left out; null when the reply holds no JSON object. */
 export function parseCallersReply(text: string, limit = CALLERS_LIMIT, prefixes: readonly string[] = []): { callers: DiagramCaller[]; more: number } | null {
   let raw: unknown
   try {
@@ -213,11 +231,16 @@ export function parseCallersReply(text: string, limit = CALLERS_LIMIT, prefixes:
   if (!isRecord(raw) || !Array.isArray(raw.callers)) return null
   const callers: DiagramCaller[] = []
   const seen = new Set<string>()
+  let tests = 0
   for (const item of raw.callers) {
     if (!isRecord(item)) continue
     const path = stripPrefixes(asString(item.path), prefixes)
     const symbol = asString(item.symbol) || '(module)'
     if (!path) continue
+    if (isTestPath(path)) {
+      tests += 1
+      continue
+    }
     const key = `${path}#${symbol}`
     if (seen.has(key)) continue
     seen.add(key)
@@ -225,7 +248,8 @@ export function parseCallersReply(text: string, limit = CALLERS_LIMIT, prefixes:
     if (typeof item.line === 'number' && Number.isFinite(item.line) && item.line > 0) caller.line = Math.floor(item.line)
     callers.push(caller)
   }
-  const total = typeof raw.total === 'number' && Number.isFinite(raw.total) ? Math.max(Math.floor(raw.total), callers.length) : callers.length
+  const counted = typeof raw.total === 'number' && Number.isFinite(raw.total) ? Math.floor(raw.total) - tests : 0
+  const total = Math.max(counted, callers.length)
   const shown = callers.slice(0, limit)
   return { callers: shown, more: Math.max(0, total - shown.length) }
 }
@@ -335,13 +359,14 @@ export function isDeclarationOf(text: string, symbol: string): boolean {
 }
 
 /**
- * Hits grouped into callers, one per enclosing symbol, capped; what the page
- * shows when no session answered.
+ * Hits grouped into callers, one per enclosing symbol, capped, test files left
+ * out; what the page shows when no session answered.
  */
 export function groupCandidates(candidates: readonly CallerCandidate[], limit = CALLERS_LIMIT): { callers: DiagramCaller[]; more: number } {
   const callers: DiagramCaller[] = []
   const seen = new Set<string>()
   for (const one of candidates) {
+    if (isTestPath(one.path)) continue
     const key = `${one.path}#${one.enclosing}`
     if (seen.has(key)) continue
     seen.add(key)
