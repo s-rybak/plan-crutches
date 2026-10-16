@@ -3,9 +3,11 @@
 import { connect, act, projectUrl } from './api.js'
 import { t } from './i18n.js'
 import { renderMarkdown, escapeHtml } from './markdown.js'
-import { renderSource, renderDiff } from './codeview.js'
-import { buildTree, renderTree, allDirKeys } from './tree.js'
+import { renderSource, renderDiff, renderReplaceDiff, renderDeletion, oldLinesBefore } from './codeview.js'
+import { buildTree, renderTree, allDirKeys, pathsUnder } from './tree.js'
 import { mountDiagram } from './diagram.js'
+import { fileDeltas, symbolDeltas, folderDelta } from './compare.js'
+import { renderTextDiff, textsDiffer } from './textdiff.js'
 
 const app = document.getElementById('app')
 const popup = document.getElementById('popup')
@@ -45,6 +47,8 @@ const ui = {
   online: false,
   planKey: '',
   replyOpen: new Set(),
+  highlight: stored('plan-crutches-highlight', '0') === '1',
+  editingSummary: false,
 }
 
 let state = null
@@ -59,18 +63,37 @@ const L = (key, params) => t(lang, key, params)
 const bodyKey = (path, symbol) => `${path}#${symbol}`
 const newId = () => Math.random().toString(36).slice(2, 10)
 /** An id no thread holds yet, so the mod keeps it and the popup can follow its thread. */
-function freshId() {
+function freshId(taken = state ? state.qa.map(one => one.id) : []) {
+  const used = new Set(taken)
   for (let attempt = 0; attempt < 8; attempt++) {
     const id = newId()
-    if (!state || !state.qa.some(one => one.id === id)) return id
+    if (!used.has(id)) return id
   }
   return newId()
 }
 // The state shape and the actions this page expects; hooks/web.ts carries the
 // same number. A session keeps the mod it started with, while this file comes
 // from disk, so an older mod behind a newer page gets a warning.
-const PROTOCOL = 3
+const PROTOCOL = 4
 const staleMod = () => Boolean(state && state.plan && state.protocol !== PROTOCOL)
+
+// ---------- what the page shows: the current plan, or an earlier version ----------
+
+const viewing = () => (state && state.viewing) || null
+const shownPlan = () => (viewing() ? viewing().plan : state.plan)
+const shownFiles = () => (viewing() ? viewing().files : state.files)
+const isReadonly = () => Boolean(viewing())
+/** The version the current plan is compared with, when the page highlights the changes. */
+const comparePlan = () => (state && state.compare && !viewing() ? state.compare.plan : null)
+const highlighting = () => Boolean(ui.highlight && comparePlan())
+
+/** The file deltas of the current plan against the compared version, or null when not highlighting. */
+function planDeltas() {
+  const compare = comparePlan()
+  if (!highlighting() || !state.plan) return null
+  const { byPath, removed } = fileDeltas(state.plan, compare)
+  return { since: state.compare.version, byPath, removed }
+}
 
 // ---------- question threads ----------
 
@@ -192,24 +215,57 @@ function renderComment(comment, { withOpen = false } = {}) {
   )
 }
 
+function shortTime(iso) {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString(lang === 'uk' ? 'uk-UA' : 'en-GB', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+}
+
+function versionSourceLabel(entry) {
+  if (entry.source === 'restored') return L('versionSource_restored', { n: entry.from ?? '?' })
+  if (entry.source === 'edited') return L('versionSource_edited')
+  return L('versionSource_received')
+}
+
+function renderVersionSelect() {
+  const versions = state.versions || []
+  if (versions.length < 2) return ''
+  const shown = viewing() ? viewing().version : state.review.version
+  const options = [...versions]
+    .sort((a, b) => b.version - a.version)
+    .map(entry => {
+      const current = entry.version === state.review.version ? ` · ${L('versionCurrent')}` : ''
+      return `<option value="${entry.version}"${entry.version === shown ? ' selected' : ''}>v${entry.version} · ${escapeHtml(shortTime(entry.receivedAt))}${current}</option>`
+    })
+    .join('')
+  return `<select class="select small" data-action="pick-version" title="${L('versions')}">${options}</select>`
+}
+
+function okCountOf(plan) {
+  const ok = state.ok || {}
+  return plan.files.filter(file => ok[file.path]).length
+}
+
 function renderHeader() {
   const { plan, review } = state
   const pending = pendingComments().length
   let action = ''
-  if (review.status === 'reviewing' && plan) {
+  if (review.status === 'reviewing' && plan && !isReadonly()) {
     action = `<button class="btn primary" data-action="submit">${pending ? L('submitWith', { n: pending }) : L('approve')}</button>`
   }
   const themeLabel = L(`theme_${ui.theme}`)
   const record = review.recordPath ? `<span title="${escapeHtml(review.recordPath)}">${L('recorded')}: ${escapeHtml(review.recordPath.replace(`${state.cwd}/`, ''))}</span>` : ''
+  const okCount = plan && plan.files.length ? `<span class="badge ok${okCountOf(plan) === plan.files.length ? ' done' : ''}" title="${L('okTitle')}">${L('okCount', { n: okCountOf(plan), m: plan.files.length })}</span>` : ''
   return (
     `<header class="top">` +
     `<div class="brand"><span class="logo"><svg viewBox="0 0 32 32"><path d="M9 10h14M9 16h10M9 22h7" stroke="white" stroke-width="3.5" stroke-linecap="round" fill="none"/></svg></span>${L('appName')}</div>` +
     (plan ? `<div class="title" title="${escapeHtml(plan.title)}">${escapeHtml(plan.title)}</div>` : '') +
     `<div class="meta">` +
-    (plan ? `<span class="badge">${L('version')}${review.version}</span>` : '') +
+    (plan ? renderVersionSelect() || `<span class="badge">${L('version')}${review.version}</span>` : '') +
     `<span class="badge status-${review.status}">${L(`status_${review.status}`)}</span>` +
     (review.isDemo ? `<span class="badge">${L('demo')}</span>` : '') +
     (plan ? `<span>${state.comments.length} ${L('comments')}</span>` : '') +
+    okCount +
     record +
     `</div>` +
     `<span class="spacer"></span>` +
@@ -241,6 +297,13 @@ function renderBanner() {
   if (!plan) banners.push(`<div class="banner">${L('noPlan')}</div>`)
   else if (review.status === 'revising') banners.push(`<div class="banner revising"><span class="spinner"></span>${L('revisingNote')}</div>`)
   else if (review.status === 'approved') banners.push(`<div class="banner approved">${L('approvedNote')}</div>`)
+  const old = viewing()
+  if (plan && old) {
+    const restore = review.status === 'reviewing' && !staleMod() ? `<button class="btn small primary" data-action="restore-version" data-version="${old.version}">${L('restoreVersion')}</button>` : ''
+    banners.push(
+      `<div class="banner viewing"><span>${L('viewingVersion', { n: old.version, m: review.version })} ${L('readOnlyVersion')}</span><span class="spacer"></span>${restore}<button class="btn small" data-action="view-current">${L('backToCurrent')}</button></div>`,
+    )
+  }
   return banners.join('')
 }
 
@@ -249,9 +312,10 @@ function renderTask(plan) {
   const source = task.source === 'jira' ? `${L('taskFromJira')}${task.key ? ` · ${escapeHtml(task.key)}` : ''}` : task.source === 'user' ? L('taskFromUser') : ''
   const text = task.text || ''
   const cut = !ui.showFullTask && text.length > TASK_LIMIT
+  const comment = isReadonly() ? '' : `<button class="btn small" data-action="comment-plan">💬 ${L('planComment')}</button>`
   return (
     `<section class="card task${ui.showTask ? '' : ' collapsed'}">` +
-    `<h2><button class="btn ghost small" data-action="toggle-task">${ui.showTask ? '▾' : '▸'}</button>${L('task')}${source ? ` <span class="hint">${source}</span>` : ''}<span class="spacer"></span><button class="btn small" data-action="comment-plan">💬 ${L('planComment')}</button></h2>` +
+    `<h2><button class="btn ghost small" data-action="toggle-task">${ui.showTask ? '▾' : '▸'}</button>${L('task')}${source ? ` <span class="hint">${source}</span>` : ''}<span class="spacer"></span>${comment}</h2>` +
     `<div class="body">` +
     (text ? `<pre data-selectable data-scope="plan">${escapeHtml(cut ? text.slice(0, TASK_LIMIT) + '…' : text)}</pre>` : `<div class="hint">${L('taskNone')}</div>`) +
     (text.length > TASK_LIMIT ? `<button class="btn ghost small" data-action="toggle-full-task">${ui.showFullTask ? L('showLess') : L('showAll')}</button>` : '') +
@@ -259,16 +323,57 @@ function renderTask(plan) {
   )
 }
 
+function renderCompareControls() {
+  const versions = state.versions || []
+  if (isReadonly() || versions.length < 2) return ''
+  const compare = state.compare
+  const options = versions
+    .filter(entry => entry.version !== state.review.version)
+    .sort((a, b) => b.version - a.version)
+    .map(entry => `<option value="${entry.version}"${compare && compare.version === entry.version ? ' selected' : ''}>v${entry.version}</option>`)
+    .join('')
+  const on = highlighting()
+  return (
+    `<span class="compare">` +
+    `<button class="btn small${on ? ' active' : ''}" data-action="toggle-highlight"${compare ? '' : ' disabled'}>${on ? L('highlightOff') : L('highlightChanges')}</button>` +
+    `<span class="hint">${L('compareWith')}</span><select class="select small" data-action="compare-version">${options}</select>` +
+    `</span>`
+  )
+}
+
 function renderSummary(plan) {
   const limit = state.summaryLimit || 9000
   const summary = plan.summary || ''
-  const cut = !ui.showFullSummary && summary.length > limit
-  const shown = cut ? summary.slice(0, limit) + '…' : summary
+  const readonly = isReadonly()
+  const editing = ui.editingSummary && !readonly && state.review.status === 'reviewing'
+  const edited =
+    !readonly && state.review.summaryEditedInVersion === state.review.version
+      ? `<span class="hint edited" title="${escapeHtml(L('summaryEditHint'))}">✎ ${L('summaryEdited', { n: state.review.summaryEditedInVersion })}</span>`
+      : ''
+  const editButton = !editing && !readonly && state.review.status === 'reviewing' ? `<button class="btn ghost small" data-action="edit-summary">✎ ${L('editSummary')}</button>` : ''
+  let body
+  if (editing) {
+    const rows = Math.min(36, Math.max(10, summary.split('\n').length + 2))
+    body =
+      `<textarea class="summary-edit" data-draft="summary" rows="${rows}" spellcheck="true">${escapeHtml(summary)}</textarea>` +
+      `<div class="edit-actions"><span class="hint">${L('summaryEditHint')} <kbd>⌘/Ctrl+Enter</kbd> ${L('save')} · <kbd>Esc</kbd> ${L('cancel')}</span><span class="spacer"></span>` +
+      `<button class="btn small" data-action="cancel-summary">${L('cancel')}</button><button class="btn small primary" data-action="save-summary">${L('saveSummary')}</button></div>`
+  } else if (highlighting()) {
+    const compare = comparePlan()
+    body = textsDiffer(compare.summary, summary)
+      ? `<div class="textdiff-legend"><ins>${L('legendIns')}</ins><del>${L('legendDel')}</del><span class="hint">${L('deltaSince', { n: state.compare.version })}</span></div>` + renderTextDiff(compare.summary, summary)
+      : `<div class="hint">${L('textDiffEmpty')}</div><div class="md" data-selectable data-scope="plan">${renderMarkdown(summary, { imageUrl: projectUrl })}</div>`
+  } else {
+    const cut = !ui.showFullSummary && summary.length > limit
+    const shown = cut ? summary.slice(0, limit) + '…' : summary
+    body =
+      `<div class="md" data-selectable data-scope="plan">${renderMarkdown(shown, { imageUrl: projectUrl })}</div>` +
+      (summary.length > limit ? `<button class="btn ghost small" data-action="toggle-summary">${ui.showFullSummary ? L('showLess') : L('showAll')}</button>` : '')
+  }
   return (
     `<section class="card summary">` +
-    `<h2>${L('summary')}<span class="spacer"></span><span class="hint">${summary.length} / ${limit}</span></h2>` +
-    `<div class="md" data-selectable data-scope="plan">${renderMarkdown(shown, { imageUrl: projectUrl })}</div>` +
-    (summary.length > limit ? `<button class="btn ghost small" data-action="toggle-summary">${ui.showFullSummary ? L('showLess') : L('showAll')}</button>` : '') +
+    `<h2>${L('summary')}${edited}<span class="spacer"></span>${renderCompareControls()}${editButton}<span class="hint">${summary.length} / ${limit}</span></h2>` +
+    body +
     `</section>`
   )
 }
@@ -294,13 +399,33 @@ function commentCounts() {
 }
 
 function renderTreePanel(plan) {
-  const roots = buildTree(plan.files)
+  const deltas = planDeltas()
+  const roots = buildTree(plan.files, deltas ? deltas.removed : [])
+  let treeDeltas = null
+  if (deltas) {
+    const folders = new Map()
+    const removedPaths = deltas.removed.map(file => file.path)
+    const walk = nodes => {
+      for (const node of nodes) {
+        if (node.kind !== 'dir') continue
+        folders.set(node.path, folderDelta(pathsUnder(node), deltas.byPath, removedPaths.filter(path => path.startsWith(`${node.path}/`))))
+        walk(node.children)
+      }
+    }
+    walk(roots)
+    treeDeltas = { since: deltas.since, byPath: deltas.byPath, folders }
+  }
+  const readonly = isReadonly()
+  const ok = readonly ? {} : state.ok || {}
+  const okCount = plan.files.filter(file => ok[file.path]).length
+  const counter = !readonly && plan.files.length ? `<span class="chip okcount${okCount === plan.files.length ? ' done' : ''}" title="${L('okTitle')}">${L('okCount', { n: okCount, m: plan.files.length })}</span>` : ''
   return (
     `<aside class="card tree-panel">` +
-    `<div class="tree-toolbar"><strong>${L('changes')}</strong><span class="spacer"></span>` +
+    `<div class="tree-toolbar"><strong>${L('changes')}</strong>${counter}<span class="spacer"></span>` +
     `<button class="btn ghost small" data-action="collapse-all">${L('collapseAll')}</button>` +
     `<button class="btn ghost small" data-action="expand-all">${L('expandAll')}</button></div>` +
-    renderTree(roots, { collapsed: ui.collapsed, selected: ui.selected, lang, commentCounts: commentCounts() }) +
+    renderTree(roots, { collapsed: ui.collapsed, selected: ui.selected, lang, commentCounts: commentCounts(), ok, deltas: treeDeltas, readonly }) +
+    (deltas && deltas.removed.length ? `<div class="hint ghost-note">${L('removedFiles')}: ${deltas.removed.length}</div>` : '') +
     `</aside>`
   )
 }
@@ -319,30 +444,77 @@ function block(inner, { path, symbol }) {
   return `<div data-selectable data-scope="code" data-path="${escapeHtml(path)}"${symbol ? ` data-symbol="${escapeHtml(symbol)}"` : ''}>${inner}</div>`
 }
 
-function renderSymbol(file, symbol) {
+function deltaChipHtml(delta) {
+  if (!delta || delta === 'same') return ''
+  const key = delta === 'added' ? 'deltaAdded' : delta === 'removed' ? 'deltaRemoved' : 'deltaChanged'
+  const sign = delta === 'added' ? '+' : delta === 'removed' ? '−' : '~'
+  return `<span class="chip delta ${delta}">${sign} ${L(key)}</span>`
+}
+
+/**
+ * One symbol card. `context.entry` is the file's view (its diff holds the
+ * code a modified symbol has today), `context.delta` and `context.previous`
+ * come from the compare view, `context.readonly` hides the actions when an
+ * earlier version is shown.
+ */
+function renderSymbol(file, symbol, context) {
   const key = bodyKey(file.path, symbol.name)
   const body = state.bodies[key]
-  const isExpanded = ui.expanded.has(key)
+  const change = symbol.change || 'new'
+  const { readonly, entry } = context
+  const isExpanded = !readonly && ui.expanded.has(key)
+  const oldLines = change === 'modified' && entry && entry.view && entry.view.format === 'diff' ? oldLinesBefore(entry.view.text, symbol) : []
   let bodyHtml = ''
   if (isExpanded) {
     if (!body || body.status === 'loading') bodyHtml = `<div class="status"><span class="spinner"></span>${L('generating')}</div>`
     else if (body.status === 'failed') bodyHtml = `<div class="status error">${L('generationFailed')}: ${escapeHtml(body.error || '')}</div>`
+    else if (oldLines.length) bodyHtml = block(renderReplaceDiff(oldLines, body.code || '', { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
     else bodyHtml = block(renderSource(body.code || '', { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
   }
+  const previous = context.previous
+  const signatureChanged = context.delta === 'changed' && previous && previous.signature !== symbol.signature
+  const signature =
+    change === 'deleted'
+      ? block(renderDeletion(symbol.signature, { path: file.path }), { path: file.path, symbol: symbol.name })
+      : signatureChanged
+        ? block(renderReplaceDiff(previous.signature.split('\n'), symbol.signature, { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
+        : block(renderSource(symbol.signature, { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
+  const wasDescription = context.delta === 'changed' && previous && previous.description !== symbol.description ? `<div class="sym-desc was-desc"><span class="hint">${L('was')}:</span> <del>${escapeHtml(previous.description || '')}</del></div>` : ''
+  const note = change === 'deleted' ? `<div class="hint">${L('deletedSymbolNote')}</div>` : change === 'modified' ? `<div class="hint">${L('modifiedSymbolNote')}</div>` : ''
+  let actions = ''
+  if (!readonly) {
+    if (change !== 'deleted') {
+      actions += isExpanded
+        ? `<button class="btn small" data-action="collapse" data-key="${escapeHtml(key)}">${L('collapseImpl')}</button>` +
+          `<button class="btn small" data-action="regen" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">${L('regenerate')}</button>`
+        : `<button class="btn small" data-action="expand" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">${L('expandImpl')}</button>`
+    }
+    actions += `<button class="btn small" data-action="comment-symbol" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">💬</button>`
+  }
   return (
-    `<div class="symbol" data-symbol-card="${escapeHtml(symbol.name)}">` +
+    `<div class="symbol change-${change}" data-symbol-card="${escapeHtml(symbol.name)}">` +
     `<div class="sym-head"><span class="chip kind">${escapeHtml(symbol.kind)}</span><span class="sym-name">${escapeHtml(symbol.name)}</span>` +
+    (change !== 'new' ? `<span class="chip change ${change}">${L(`change_${change}`)}</span>` : '') +
+    deltaChipHtml(context.delta) +
     (symbol.anchor ? `<span class="anchor">${L('anchor')}: ${escapeHtml(symbol.anchor)}</span>` : '') +
     `<span class="spacer"></span>` +
-    (isExpanded
-      ? `<button class="btn small" data-action="collapse" data-key="${escapeHtml(key)}">${L('collapseImpl')}</button>` +
-        `<button class="btn small" data-action="regen" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">${L('regenerate')}</button>`
-      : `<button class="btn small" data-action="expand" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">${L('expandImpl')}</button>`) +
-    `<button class="btn small" data-action="comment-symbol" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">💬</button>` +
+    actions +
     `</div>` +
-    block(renderSource(symbol.signature, { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name }) +
+    signature +
     `<div class="sym-desc">${escapeHtml(symbol.description || '')}</div>` +
+    wasDescription +
+    note +
     bodyHtml +
+    `</div>`
+  )
+}
+
+function renderRemovedSymbol(file, symbol) {
+  return (
+    `<div class="symbol ghost" data-symbol-card="${escapeHtml(symbol.name)}">` +
+    `<div class="sym-head"><span class="chip kind">${escapeHtml(symbol.kind)}</span><span class="sym-name">${escapeHtml(symbol.name)}</span>${deltaChipHtml('removed')}</div>` +
+    renderDeletion(symbol.signature, { path: file.path }) +
+    `<div class="sym-desc">${escapeHtml(symbol.description || '')}</div>` +
     `</div>`
   )
 }
@@ -359,8 +531,12 @@ function inlineFor(file) {
 }
 
 function renderFile(file) {
-  const entry = state.files[file.path] || { loaded: false }
-  const inline = inlineFor(file)
+  const readonly = isReadonly()
+  const entry = shownFiles()[file.path] || { loaded: false }
+  const inline = readonly ? null : inlineFor(file)
+  const deltas = planDeltas()
+  const compare = comparePlan()
+  const symbolDelta = deltas ? symbolDeltas(file, compare.files.find(one => one.path === file.path)) : null
   let changes = ''
   if (file.status === 'new') {
     changes = `<div class="section-title">${L('newFileTitle')}</div>`
@@ -383,14 +559,32 @@ function renderFile(file) {
       (entry.view ? block(renderDiff(entry.view.text, { path: file.path, commented: linesCommented(file.path), inline: file.status === 'modified' ? inline : null }), { path: file.path }) : '') +
       (showFull ? `<div class="section-title">${L('fullFile')}</div>` + renderFullFile(file.path) : '')
   }
-  const comments = state.comments.filter(one => one.target.path === file.path)
+  const comments = readonly ? [] : state.comments.filter(one => one.target.path === file.path)
+  const symbols = file.symbols.map(symbol =>
+    renderSymbol(file, symbol, {
+      readonly,
+      entry,
+      delta: symbolDelta ? symbolDelta.byName.get(symbol.name) : null,
+      previous: symbolDelta ? symbolDelta.previous.get(symbol.name) : null,
+    }),
+  )
+  const removed = symbolDelta && symbolDelta.removed.length ? `<div class="section-title">${L('removedSymbols')}</div>` + symbolDelta.removed.map(symbol => renderRemovedSymbol(file, symbol)).join('') : ''
+  const ok = !readonly && state.ok && state.ok[file.path]
   return (
     `<section class="card detail-card">` +
-    `<div class="file-head"><button class="btn ghost small" data-action="back">←</button><span class="path">${escapeHtml(file.path)}</span><span class="chip ${file.status}">${L(`status_${file.status}`)}</span><span class="spacer"></span>` +
-    `<button class="btn small" data-action="comment-file" data-path="${escapeHtml(file.path)}">💬 ${L('commentOnFile')}</button></div>` +
+    `<div class="file-head"><button class="btn ghost small" data-action="back">←</button><span class="path">${escapeHtml(file.path)}</span><span class="chip ${file.status}">${L(`status_${file.status}`)}</span>` +
+    (deltas ? deltaChipHtml(deltas.byPath.get(file.path)) : '') +
+    (ok ? `<span class="chip okcount done" title="${L('okTitleOn')}">✓ OK v${ok.version}</span>` : '') +
+    `<span class="spacer"></span>` +
+    (readonly
+      ? ''
+      : `<button class="btn small${ok ? ' active' : ''}" data-action="ok-toggle" data-path="${escapeHtml(file.path)}" data-ok="${ok ? 'off' : 'on'}" title="${escapeHtml(ok ? L('okTitleOn') : L('okTitle'))}">✓ OK</button>` +
+        `<button class="btn small" data-action="comment-file" data-path="${escapeHtml(file.path)}">💬 ${L('commentOnFile')}</button>`) +
+    `</div>` +
     `<div class="desc" data-selectable data-scope="file" data-path="${escapeHtml(file.path)}">${escapeHtml(file.description || '')}</div>` +
     `<div class="section-title">${L('symbols')}</div>` +
-    (file.symbols.length ? file.symbols.map(symbol => renderSymbol(file, symbol)).join('') : `<div class="hint">${L('noSymbols')}</div>`) +
+    (file.symbols.length ? symbols.join('') : `<div class="hint">${L('noSymbols')}</div>`) +
+    removed +
     changes +
     (comments.length ? `<div class="section-title">${L('tab_comments')}</div><div class="comments">${comments.map(one => renderComment(one)).join('')}</div>` : '') +
     `</section>`
@@ -398,11 +592,12 @@ function renderFile(file) {
 }
 
 function renderChanges() {
-  const { plan, review } = state
+  const { review } = state
+  const plan = shownPlan()
   if (!plan) return ''
   const file = ui.selected ? plan.files.find(one => one.path === ui.selected) : null
   const detail = file ? renderFile(file) : `<section class="card detail"><div class="empty">${L('pickFile')}</div></section>`
-  return renderTask(plan) + renderSummary(plan) + renderWarnings(review) + `<div class="split">${renderTreePanel(plan)}<div class="detail">${detail}</div></div>`
+  return renderTask(plan) + renderSummary(plan) + (isReadonly() ? '' : renderWarnings(review)) + `<div class="split">${renderTreePanel(plan)}<div class="detail">${detail}</div></div>`
 }
 
 function renderQaItem(item) {
@@ -445,12 +640,30 @@ function renderAsk() {
   )
 }
 
+function renderVersions() {
+  const versions = state.versions || []
+  if (!versions.length) return ''
+  const current = state.review.version
+  const canRestore = state.review.status === 'reviewing' && !staleMod()
+  const rows = [...versions]
+    .sort((a, b) => b.version - a.version)
+    .map(entry => {
+      const isCurrent = entry.version === current
+      const look = isCurrent ? `<span class="chip count">${L('versionCurrent')}</span>` : `<button class="btn small ghost" data-action="view-version" data-version="${entry.version}">${L('open')}</button>`
+      const compare = isCurrent ? '' : `<button class="btn small ghost" data-action="compare-version-button" data-version="${entry.version}">${L('highlightChanges')}</button>`
+      const restore = !isCurrent && canRestore ? `<button class="btn small" data-action="restore-version" data-version="${entry.version}">${L('restoreVersion')}</button>` : ''
+      return `<li><strong>v${entry.version}</strong><span class="hint">${escapeHtml(shortTime(entry.receivedAt))} · ${escapeHtml(versionSourceLabel(entry))} · ${escapeHtml(entry.title)} · ${entry.fileCount}</span><span class="spacer"></span>${look}${compare}${restore}</li>`
+    })
+    .join('')
+  return `<div class="section-title">${L('versions')}</div><ul class="versions">${rows}</ul>`
+}
+
 function renderComments() {
   const groups = { pending: [], sent: [], resolved: [] }
   for (const comment of state.comments) groups[commentState(comment)].push(comment)
   const section = (key, list) => (list.length ? `<div class="section-title">${L(key)} <span class="chip count">${list.length}</span></div><div class="comments">${list.map(one => renderComment(one, { withOpen: true })).join('')}</div>` : '')
   const history = state.review.history.length ? `<div class="section-title">${L('history')}</div><ul class="hint">${state.review.history.map(one => `<li>${escapeHtml(one)}</li>`).join('')}</ul>` : ''
-  return `<section class="card">${state.comments.length ? section('pending', groups.pending) + section('sent', groups.sent) + section('resolved', groups.resolved) : `<div class="hint">${L('noComments')}</div>`}${history}</section>`
+  return `<section class="card">${state.comments.length ? section('pending', groups.pending) + section('sent', groups.sent) + section('resolved', groups.resolved) : `<div class="hint">${L('noComments')}</div>`}${renderVersions()}${history}</section>`
 }
 
 // The diagram keeps its own element across redraws: its view (rotation, zoom,
@@ -543,10 +756,12 @@ window.addEventListener(
 )
 
 function requestFileIfNeeded() {
-  if (!state?.plan || !ui.selected) return
-  const file = state.plan.files.find(one => one.path === ui.selected)
+  if (!state || !ui.selected) return
+  const plan = shownPlan()
+  if (!plan) return
+  const file = plan.files.find(one => one.path === ui.selected)
   if (!file || file.status === 'new') return
-  const entry = state.files[file.path]
+  const entry = shownFiles()[file.path]
   if (entry && entry.loaded) return
   if (ui.requested.has(file.path)) return
   ui.requested.add(file.path)
@@ -566,24 +781,29 @@ function onState(next) {
     ui.inlineExpanded.clear()
     ui.fullFile.clear()
     ui.fullText.clear()
-    if (ui.selected && !(next.plan && next.plan.files.some(one => one.path === ui.selected))) ui.selected = null
+    ui.editingSummary = false
   }
+  const plan = shownPlan()
+  if (ui.selected && !(plan && plan.files.some(one => one.path === ui.selected))) ui.selected = null
   if (next.notice && next.notice.id !== lastNotice) {
     lastNotice = next.notice.id
     toast(next.notice.text)
   }
   render()
-  // The popup follows its own thread: the answer arrives with the state.
-  if (popupState && popupState.mode === 'ask' && popupState.qaId) renderPopup()
+  // The popup follows its own thread or explanation: the answer arrives with the state.
+  if (popupState && ((popupState.mode === 'ask' && popupState.qaId) || popupState.mode === 'explain')) renderPopup()
 }
 
 // ---------- popup ----------
-// One floating window with two tabs. Comment saves a review comment on the
+// One floating window with three tabs. Comment saves a review comment on the
 // target. Ask opens a question thread about the same target; the thread goes
 // on in the window and is kept in the Ask tab, and can end up as a comment.
+// Explain asks, once the tab opens, what the place is, where it sits and why
+// the plan changes it.
 
 function openPopup({ title, target, selection, prefill, at, mode = 'comment' }) {
-  popupState = { title, target: target || {}, selection: selection || '', prefill: prefill || '', at, mode, qaId: null, pending: null }
+  popupState = { title, target: target || {}, selection: selection || '', prefill: prefill || '', at, mode, qaId: null, pending: null, explainId: null }
+  if (mode === 'explain') requestExplanation()
   renderPopup({ focus: true })
 }
 
@@ -619,6 +839,38 @@ function popupPending() {
   return pending.question
 }
 
+/** The same place of the plan gets the same explanation: one key per target. */
+function explainKey(target) {
+  return JSON.stringify([target.path || '', target.symbol || '', target.lines || null, (target.selection || '').slice(0, 2000)])
+}
+
+/** The explanation of the popup's target, its own or an earlier one for the same place in this version. */
+function popupExplanation() {
+  if (!popupState || !state) return null
+  const all = state.explanations || {}
+  if (popupState.explainId && all[popupState.explainId]) return all[popupState.explainId]
+  const key = explainKey(popupTarget())
+  const found = Object.entries(all).find(([, one]) => one.createdInVersion === state.review.version && explainKey(one.target || {}) === key)
+  if (found) {
+    popupState.explainId = found[0]
+    return found[1]
+  }
+  return null
+}
+
+/** Asks for the explanation of the popup's target, unless one is there or on its way. */
+function requestExplanation(force = false) {
+  if (!state || !state.plan || !popupState) return
+  const existing = popupExplanation()
+  if (existing && !force && existing.status !== 'failed') return
+  if (popupState.explainWaiting && !force) return
+  if (staleMod()) return toast(L('staleMod'))
+  const id = freshId(Object.keys(state.explanations || {}))
+  popupState.explainId = id
+  popupState.explainWaiting = true
+  void run({ type: 'explain', id, target: popupTarget(), ...(ui.selected ? { focus: ui.selected } : {}) })
+}
+
 function renderPopup({ focus = false, keepDraft = true } = {}) {
   if (!popupState) return
   const { title, target, selection, mode } = popupState
@@ -634,6 +886,7 @@ function renderPopup({ focus = false, keepDraft = true } = {}) {
     `<div class="ptabs">` +
     `<button class="ptab${mode === 'comment' ? ' active' : ''}" data-popup="mode" data-mode="comment">💬 ${L('popupComment')}</button>` +
     `<button class="ptab${mode === 'ask' ? ' active' : ''}" data-popup="mode" data-mode="ask">? ${L('popupAsk')}</button>` +
+    `<button class="ptab${mode === 'explain' ? ' active' : ''}" data-popup="mode" data-mode="explain">ⓘ ${L('popupExplain')}</button>` +
     `</div>`
   let body
   if (mode === 'comment') {
@@ -641,6 +894,19 @@ function renderPopup({ focus = false, keepDraft = true } = {}) {
       `<textarea id="popup-text" placeholder="${escapeHtml(L('commentPlaceholder'))}"></textarea>` +
       `<div class="pactions"><span class="hint"><kbd>Enter</kbd> ${L('save')} · <kbd>Esc</kbd> ${L('cancel')}</span>` +
       `<button class="btn" data-popup="cancel">${L('cancel')}</button><button class="btn primary" data-popup="save">${L('save')}</button></div>`
+  } else if (mode === 'explain') {
+    const explanation = popupExplanation()
+    if (explanation && explanation.status !== 'asking') popupState.explainWaiting = false
+    let content
+    if (!explanation || explanation.status === 'asking') content = `<div class="status"><span class="spinner"></span> ${L('explaining')}</div>`
+    else if (explanation.status === 'failed') content = `<div class="msg assistant failed">${L('explainFailed')}: ${escapeHtml(explanation.text || '')}</div>`
+    else content = `<div class="explain md" data-selectable data-scope="plan">${renderMarkdown(explanation.text || '', { imageUrl: projectUrl })}</div>`
+    body =
+      content +
+      `<div class="pactions"><span class="hint"><kbd>Esc</kbd> ${L('close')}</span>` +
+      (explanation && explanation.status !== 'asking' ? `<button class="btn" data-popup="explain-again">${L('explainAgain')}</button>` : '') +
+      `<button class="btn" data-popup="mode" data-mode="ask">? ${L('explainAsk')}</button>` +
+      `<button class="btn" data-popup="cancel">${L('close')}</button></div>`
   } else {
     // The textarea stays enabled while an answer is on its way, so it keeps
     // the focus and the next question can be typed; sending waits.
@@ -659,11 +925,11 @@ function renderPopup({ focus = false, keepDraft = true } = {}) {
     body
   popup.hidden = false
   const textarea = popup.querySelector('textarea')
-  if (draft) textarea.value = draft
+  if (textarea && draft) textarea.value = draft
   const thread = popup.querySelector('.thread')
   if (thread) thread.scrollTop = thread.scrollHeight
   placePopup()
-  if (focus || hadFocus) {
+  if (textarea && (focus || hadFocus)) {
     textarea.focus({ preventScroll: true })
     textarea.setSelectionRange(textarea.value.length, textarea.value.length)
   }
@@ -752,8 +1018,13 @@ popup.addEventListener('click', event => {
     case 'mode':
       if (popupState && popupState.mode !== button.dataset.mode) {
         popupState.mode = button.dataset.mode
+        if (popupState.mode === 'explain') requestExplanation()
         renderPopup({ focus: true })
       }
+      break
+    case 'explain-again':
+      requestExplanation(true)
+      renderPopup()
       break
     case 'thread-comment':
       threadToComment()
@@ -784,6 +1055,7 @@ function elementOf(node) {
 }
 
 function checkSelection() {
+  if (isReadonly()) return
   const selection = window.getSelection()
   if (!selection || selection.isCollapsed || selection.rangeCount === 0) return
   const text = selection.toString().trim()
@@ -811,7 +1083,7 @@ function checkSelection() {
 
 document.addEventListener('mouseup', event => {
   if (event.button !== 0) return
-  if (event.target.closest('#popup') || event.target.closest('button, textarea, input, .diagram-card')) return
+  if (event.target.closest('#popup') || event.target.closest('button, textarea, input, select, .diagram-card')) return
   setTimeout(checkSelection, 0)
 })
 
@@ -832,11 +1104,13 @@ function selectFile(path) {
 app.addEventListener('click', event => {
   const control = event.target.closest('[data-action]')
   if (control) {
+    if (control.tagName === 'SELECT') return
     handleAction(control)
     return
   }
   const row = event.target.closest('.row')
   if (row) {
+    if (row.dataset.ghost) return
     if (row.dataset.kind === 'dir') {
       if (ui.collapsed.has(row.dataset.key)) ui.collapsed.delete(row.dataset.key)
       else ui.collapsed.add(row.dataset.key)
@@ -847,8 +1121,33 @@ app.addEventListener('click', event => {
   }
 })
 
+app.addEventListener('change', event => {
+  const control = event.target.closest('select[data-action]')
+  if (!control) return
+  const value = Number(control.value)
+  if (control.dataset.action === 'pick-version') {
+    run({ type: 'viewVersion', version: value === state.review.version ? null : value })
+  } else if (control.dataset.action === 'compare-version') {
+    ui.highlight = true
+    store('plan-crutches-highlight', '1')
+    run({ type: 'compareWith', version: value })
+  }
+})
+
 app.addEventListener('keydown', event => {
-  if (event.key !== 'Enter' || event.target.tagName !== 'TEXTAREA') return
+  if (event.target.tagName !== 'TEXTAREA') return
+  if (event.target.dataset.draft === 'summary') {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      ui.editingSummary = false
+      render()
+    } else if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault()
+      saveSummary()
+    }
+    return
+  }
+  if (event.key !== 'Enter') return
   // Enter sends, Shift+Enter adds a line; Cmd/Ctrl+Enter sends too.
   if (event.shiftKey) return
   if (event.target.id === 'ask-input') {
@@ -879,6 +1178,18 @@ function sendReply(id) {
   if (staleMod()) return toast(L('staleMod'))
   input.value = ''
   run({ type: 'askMore', id, question })
+}
+
+function saveSummary() {
+  const area = app.querySelector('textarea[data-draft="summary"]')
+  if (!area || !state || !state.plan) return
+  const text = area.value.replace(/\r\n?/g, '\n').trimEnd()
+  ui.editingSummary = false
+  if (text !== (state.plan.summary || '')) {
+    if (staleMod()) return toast(L('staleMod'))
+    run({ type: 'editSummary', text })
+  }
+  render()
 }
 
 function handleAction(control) {
@@ -914,8 +1225,47 @@ function handleAction(control) {
       ui.showFullSummary = !ui.showFullSummary
       render()
       break
+    case 'edit-summary':
+      ui.editingSummary = true
+      render()
+      app.querySelector('textarea[data-draft="summary"]')?.focus()
+      break
+    case 'cancel-summary':
+      ui.editingSummary = false
+      render()
+      break
+    case 'save-summary':
+      saveSummary()
+      break
+    case 'toggle-highlight':
+      ui.highlight = !ui.highlight
+      store('plan-crutches-highlight', ui.highlight ? '1' : '0')
+      render()
+      break
+    case 'compare-version-button':
+      ui.highlight = true
+      store('plan-crutches-highlight', '1')
+      ui.tab = 'changes'
+      run({ type: 'compareWith', version: Number(data.version) })
+      render()
+      break
+    case 'view-version':
+      ui.tab = 'changes'
+      run({ type: 'viewVersion', version: Number(data.version) })
+      break
+    case 'view-current':
+      run({ type: 'viewVersion', version: null })
+      break
+    case 'restore-version':
+      if (staleMod()) return toast(L('staleMod'))
+      if (window.confirm(L('restoreConfirm', { n: data.version }))) run({ type: 'restoreVersion', version: Number(data.version) })
+      break
+    case 'ok-toggle':
+      if (staleMod()) return toast(L('staleMod'))
+      run({ type: 'setOk', paths: [data.path], ok: data.ok !== 'off' })
+      break
     case 'collapse-all':
-      ui.collapsed = new Set(allDirKeys(buildTree(state.plan.files)))
+      ui.collapsed = new Set(allDirKeys(buildTree(shownPlan().files)))
       render()
       break
     case 'expand-all':

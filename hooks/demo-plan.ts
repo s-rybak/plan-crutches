@@ -59,14 +59,21 @@ Users are logged out when the access token expires because nothing refreshes the
     {
       "path": "src/auth/user.ts",
       "status": "modified",
-      "description": "Refresh the session before returning the current user when the token is close to expiry.",
+      "description": "Refresh the session before returning the current user when the token is close to expiry; drop the display-name helper.",
       "symbols": [
         {
           "name": "getCurrentUser",
           "kind": "function",
+          "change": "modified",
           "signature": "export async function getCurrentUser(): Promise<User | null> {",
-          "description": "Returns the current user, refreshing the session first when isExpiringSoon says so.",
-          "anchor": "after loadUser"
+          "description": "Returns the current user, refreshing the session first when isExpiringSoon says so."
+        },
+        {
+          "name": "displayNameOf",
+          "kind": "function",
+          "change": "deleted",
+          "signature": "export function displayNameOf(user: User): string {",
+          "description": "Moves to the presentation layer; nothing in auth uses it."
         }
       ]
     },

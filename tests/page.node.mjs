@@ -210,3 +210,107 @@ test('diagram layout: a dragged block keeps its place, the board grows and the p
   assert.ok(wide.height <= MAX_STACK + 2 * MARGIN + 1)
   assert.equal(wide.blocks.length, 12, 'every block is drawn')
 })
+
+test('tree: OK boxes per file and folder, delta chips and ghost rows for dropped files', async () => {
+  const { okUnder } = await import('../web/tree.js')
+  const roots = buildTree(
+    [
+      { path: 'src/b.ts', status: 'modified' },
+      { path: 'src/auth/a.ts', status: 'new' },
+    ],
+    [{ path: 'src/auth/old.ts', status: 'modified' }],
+  )
+  const auth = roots[0].children[0]
+  assert.deepEqual(pathsUnder(auth), ['src/auth/a.ts'], 'a ghost is not a planned file')
+  assert.deepEqual(okUnder(roots[0], { 'src/auth/a.ts': { version: 1, at: 't' } }), { marked: 1, total: 2 })
+  const options = { collapsed: new Set(), selected: null, lang: 'en', commentCounts: new Map() }
+  const plain = renderTree(roots, { ...options, ok: { 'src/auth/a.ts': { version: 1, at: 't' } } })
+  assert.match(plain, /class="okbox on" data-action="ok-toggle" data-path="src\/auth\/a.ts" data-ok="off"/)
+  assert.match(plain, /class="okbox part" data-action="ok-toggle" data-path="src\/" data-ok="on"/)
+  assert.match(plain, /class="okbox on" data-action="ok-toggle" data-path="src\/auth\/" data-ok="off"/)
+  assert.match(plain, /class="row file modified" data-key="file:src\/b.ts"[^>]*><span class="caret"><\/span><button class="okbox" data-action="ok-toggle" data-path="src\/b.ts" data-ok="on"/)
+  assert.match(plain, /class="row file modified ghost" data-key="file:src\/auth\/old.ts"[^>]*data-ghost="1"/)
+  assert.doesNotMatch(plain, /data-action="comment-node" data-path="src\/auth\/old.ts"/, 'a ghost row takes no comment')
+  assert.doesNotMatch(plain, /data-action="ok-toggle" data-path="src\/auth\/old.ts"/, 'a ghost row takes no OK')
+  const deltas = { since: 1, byPath: new Map([['src/b.ts', 'changed'], ['src/auth/a.ts', 'added']]), folders: new Map([['src', 'changed'], ['src/auth', 'changed']]) }
+  const marked = renderTree(roots, { ...options, deltas })
+  assert.match(marked, /<span class="chip delta changed"[^>]*>~ changed<\/span>/)
+  assert.match(marked, /<span class="chip delta added"[^>]*>\+ added<\/span>/)
+  assert.match(marked, /<span class="chip delta removed"[^>]*>− removed<\/span>/)
+  const readonly = renderTree(roots, { ...options, readonly: true })
+  assert.doesNotMatch(readonly, /data-action="ok-toggle"/)
+  assert.doesNotMatch(readonly, /data-action="comment-node"/)
+})
+
+test('compare: files and symbols added, changed, dropped or the same between two versions', async () => {
+  const { fileDeltas, symbolDeltas, folderDelta, sameFile } = await import('../web/compare.js')
+  const sym = (name, extra = {}) => ({ name, kind: 'function', signature: `function ${name}() {`, description: 'd', ...extra })
+  const before = {
+    files: [
+      { path: 'a.ts', status: 'modified', description: 'A', symbols: [sym('f'), sym('g')] },
+      { path: 'b.ts', status: 'new', description: 'B', symbols: [] },
+      { path: 'gone.ts', status: 'deleted', description: '', symbols: [] },
+    ],
+  }
+  const after = {
+    files: [
+      { path: 'a.ts', status: 'modified', description: 'A', symbols: [sym('f', { change: 'modified' }), sym('h')] },
+      { path: 'b.ts', status: 'new', description: 'B', symbols: [] },
+      { path: 'c.ts', status: 'new', description: 'C', symbols: [] },
+    ],
+  }
+  const files = fileDeltas(after, before)
+  assert.deepEqual([...files.byPath.entries()], [['a.ts', 'changed'], ['b.ts', 'same'], ['c.ts', 'added']])
+  assert.deepEqual(files.removed.map(file => file.path), ['gone.ts'])
+  assert.equal(sameFile(before.files[1], after.files[1]), true)
+  assert.deepEqual(fileDeltas(after, null), { byPath: new Map(), removed: [] })
+  const symbols = symbolDeltas(after.files[0], before.files[0])
+  assert.deepEqual([...symbols.byName.entries()], [['f', 'changed'], ['h', 'added']])
+  assert.deepEqual(symbols.removed.map(symbol => symbol.name), ['g'])
+  assert.equal(symbols.previous.get('f').change, undefined)
+  assert.deepEqual([...symbolDeltas(after.files[2], undefined).byName.entries()], [])
+  assert.equal(folderDelta(['b.ts'], files.byPath, []), 'same')
+  assert.equal(folderDelta(['b.ts'], files.byPath, ['gone.ts']), 'changed')
+  assert.equal(folderDelta(['a.ts', 'b.ts'], files.byPath, []), 'changed')
+})
+
+test('textdiff: words that changed get marks, unchanged lines stay plain, html is escaped', async () => {
+  const { diffSequences, tokenize, renderTextDiff, textsDiffer, countChanges } = await import('../web/textdiff.js')
+  assert.deepEqual(
+    diffSequences(['a', 'b', 'c'], ['a', 'x', 'c']).map(op => `${op.type}:${op.value}`),
+    ['eq:a', 'del:b', 'ins:x', 'eq:c'],
+  )
+  assert.deepEqual(tokenize('Add a cache, now!'), ['Add', ' ', 'a', ' ', 'cache', ',', ' ', 'now', '!'])
+  const html = renderTextDiff('Keep users signed in.\nThe cache is per process.\nOld line.', 'Keep users signed in.\nThe cache is per <b>process</b> and per user.\nNew line.')
+  assert.match(html, /^<div class="textdiff">Keep users signed in\.\n/)
+  assert.match(html, /<ins>&lt;b&gt;<\/ins>/)
+  assert.match(html, /<ins>&lt;\/b&gt; and per user<\/ins>/)
+  assert.match(html, /<del>Old<\/del><ins>New<\/ins> line\./)
+  assert.doesNotMatch(html, /<b>/)
+  assert.equal(textsDiffer('a\r\nb', 'a\nb'), false)
+  assert.equal(textsDiffer('a', 'b'), true)
+  assert.deepEqual(countChanges('one two three', 'one three four'), { added: 1, removed: 1 })
+  const big = Array.from({ length: 3000 }, (_, index) => `w${index}`).join(' ')
+  assert.match(renderTextDiff(big, `${big} tail`), /<ins>/)
+})
+
+test('codeview: a modified symbol shows its old lines before the stub, and the replace and deletion views carry both signs', async () => {
+  const { oldLinesBefore, renderReplaceDiff, renderDeletion } = await import('../web/codeview.js')
+  const diff = ['@@ -1,6 +1,5 @@', ' import x', '-export function f(): void {', '-  return 1', '-}', '+// New f.', '+export function f(): void {', '+  // implementation: expand in Plan Crutches', '+}', ' tail'].join('\n')
+  const symbol = { name: 'f', signature: 'export function f(): void {' }
+  assert.deepEqual(oldLinesBefore(diff, symbol), ['export function f(): void {', '  return 1', '}'])
+  assert.deepEqual(oldLinesBefore(diff, { name: 'g', signature: 'function g()' }), [])
+  const replace = renderReplaceDiff(['function f() {', '  return 1', '}'], 'function f() {\n  return 2\n}', { path: 'x.ts', commented: new Set([2]) })
+  assert.equal((replace.match(/class="line del"/g) || []).length, 3)
+  assert.equal((replace.match(/class="line add/g) || []).length, 3)
+  assert.match(replace, /class="line add commented" data-line="2" data-side="new"/)
+  const deletion = renderDeletion('function g() {\n}', { path: 'x.ts' })
+  assert.equal((deletion.match(/class="line del"/g) || []).length, 2)
+  assert.doesNotMatch(deletion, /class="line add/)
+  assert.doesNotMatch(deletion, /class="line hunk"/, 'a synthetic diff shows no hunk header')
+  assert.doesNotMatch(replace, /class="line hunk"/)
+  const inlineReady = { path: 'x.ts', symbols: [symbol], bodies: { 'x.ts#f': { status: 'ready', code: 'export function f(): void {\n  return 2\n}' } }, expanded: new Set(['x.ts#f']), lang: 'en', commentedFor: () => new Set() }
+  const expanded = renderDiff(diff, { path: 'x.ts', inline: inlineReady })
+  assert.ok(expanded.indexOf('class="line del"') < expanded.indexOf('class="inline-body"'), 'the old lines stay above the generated body')
+  assert.equal((expanded.match(/class="line del"/g) || []).length, 3)
+})

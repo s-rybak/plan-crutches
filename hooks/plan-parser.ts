@@ -1,4 +1,4 @@
-import type { FileStatus, PlanFile, PlanModel, PlanSymbol, PlanTask, SymbolKind } from '../types'
+import type { FileStatus, PlanFile, PlanModel, PlanSymbol, PlanTask, SymbolChange, SymbolKind } from '../types'
 
 export type ParseResult =
   | { ok: true; plan: PlanModel; warnings: string[] }
@@ -6,31 +6,35 @@ export type ParseResult =
 
 const BLOCK_OPEN = /^[ \t]*```+[ \t]*(?:json[ \t]+)?plan-crutches[^\n]*$/
 
+type BlockRange = { open: number; close: number }
+
+/** The lines of the last closed plan-crutches block: its fence lines, or null. */
+function findBlockRange(lines: readonly string[]): BlockRange | null {
+  let found: BlockRange | null = null
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? ''
+    if (!BLOCK_OPEN.test(line)) continue
+    const fence = (line.match(/```+/) ?? ['```'])[0]
+    for (let j = i + 1; j < lines.length; j++) {
+      const inner = lines[j] ?? ''
+      if (inner.trim().startsWith(fence) && inner.trim().replace(/`/g, '').trim() === '') {
+        found = { open: i, close: j }
+        i = j
+        break
+      }
+    }
+  }
+  return found
+}
+
 /**
  * Finds the last fenced block whose info string names plan-crutches and
  * returns its inner text, or null when the markdown holds none.
  */
 export function findBlock(markdown: string): string | null {
   const lines = markdown.split('\n')
-  let found: string | null = null
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i] ?? ''
-    if (!BLOCK_OPEN.test(line)) continue
-    const fence = (line.match(/```+/) ?? ['```'])[0]
-    const body: string[] = []
-    let closed = false
-    for (let j = i + 1; j < lines.length; j++) {
-      const inner = lines[j] ?? ''
-      if (inner.trim().startsWith(fence) && inner.trim().replace(/`/g, '').trim() === '') {
-        closed = true
-        i = j
-        break
-      }
-      body.push(inner)
-    }
-    if (closed) found = body.join('\n')
-  }
-  return found
+  const range = findBlockRange(lines)
+  return range ? lines.slice(range.open + 1, range.close).join('\n') : null
 }
 
 /** Removes every plan-crutches block from the markdown. */
@@ -98,6 +102,23 @@ function normalizeKind(value: unknown): SymbolKind {
   return 'other'
 }
 
+/**
+ * What the plan does to a symbol, from its `change` field (or the older
+ * spellings `status`, `op`, `action`), else from the anchor's wording. A
+ * symbol of a new file is always new.
+ */
+export function normalizeChange(record: Record<string, unknown>, fileStatus: FileStatus): SymbolChange {
+  if (fileStatus === 'new') return 'new'
+  const raw = [record.change, record.status, record.op, record.operation, record.action].map(value => asString(value).toLowerCase().trim()).find(Boolean) ?? ''
+  if (['modified', 'modify', 'changed', 'change', 'update', 'updated', 'edit', 'edited', 'replace', 'replaced', 'rewrite', 'rewritten', 'rename', 'renamed', 'move', 'moved'].includes(raw)) return 'modified'
+  if (['deleted', 'delete', 'removed', 'remove', 'drop', 'dropped'].includes(raw)) return 'deleted'
+  if (['new', 'added', 'add', 'create', 'created'].includes(raw)) return 'new'
+  const anchor = asString(record.anchor).toLowerCase()
+  if (/\b(replace|replaces|replacing|modif\w*|rewrite|rewrites|change|changes|update|updates)\b/.test(anchor)) return 'modified'
+  if (/\b(delete|deletes|remove|removes|drop|drops)\b/.test(anchor)) return 'deleted'
+  return 'new'
+}
+
 /** The identifier a signature declares: the one before its `(`, else after a keyword. */
 export function nameFromSignature(signature: string): string {
   const first = signature.split('\n')[0] ?? ''
@@ -109,7 +130,7 @@ export function nameFromSignature(signature: string): string {
   return tokens[tokens.length - 1] ?? ''
 }
 
-function normalizeSymbol(raw: unknown, warnings: string[], path: string): PlanSymbol | null {
+function normalizeSymbol(raw: unknown, warnings: string[], path: string, fileStatus: FileStatus): PlanSymbol | null {
   if (typeof raw !== 'object' || raw === null) return null
   const record = raw as Record<string, unknown>
   const signature = asString(record.signature).trim()
@@ -126,6 +147,8 @@ function normalizeSymbol(raw: unknown, warnings: string[], path: string): PlanSy
   }
   const anchor = asString(record.anchor).trim()
   if (anchor) symbol.anchor = anchor
+  const change = normalizeChange(record, fileStatus)
+  if (change !== 'new') symbol.change = change
   return symbol
 }
 
@@ -141,15 +164,16 @@ function normalizeFile(raw: unknown, warnings: string[]): PlanFile | null {
     warnings.push('a file without a path was dropped')
     return null
   }
+  const status = normalizeStatus(record.status, warnings, path)
   const symbolsRaw = Array.isArray(record.symbols) ? record.symbols : []
   const symbols: PlanSymbol[] = []
   for (const item of symbolsRaw) {
-    const symbol = normalizeSymbol(item, warnings, path)
+    const symbol = normalizeSymbol(item, warnings, path, status)
     if (symbol) symbols.push(symbol)
   }
   return {
     path,
-    status: normalizeStatus(record.status, warnings, path),
+    status,
     description: asString(record.description).trim(),
     symbols,
   }
@@ -221,6 +245,32 @@ export function planFromMarkdown(markdown: string): PlanModel {
     task: { source: 'none', text: '' },
     files: [],
   }
+}
+
+/**
+ * The plan file with the summary the user edited put in: into the block's
+ * `summary` field when the block carries one, else in place of the
+ * markdown above the block, else as the whole file.
+ */
+export function applySummary(markdown: string, summary: string): string {
+  const text = summary.replace(/\r\n?/g, '\n').trimEnd()
+  const lines = markdown.replace(/\r\n?/g, '\n').split('\n')
+  const range = findBlockRange(lines)
+  if (!range) return `${text}\n`
+  let raw: unknown = null
+  try {
+    raw = parseJsonLenient(lines.slice(range.open + 1, range.close).join('\n'))
+  } catch {
+    raw = null
+  }
+  if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+    const record = raw as Record<string, unknown>
+    if (typeof record.summary === 'string' && record.summary.trim()) {
+      const json = JSON.stringify({ ...record, summary: text }, null, 2).split('\n')
+      return [...lines.slice(0, range.open + 1), ...json, ...lines.slice(range.close)].join('\n')
+    }
+  }
+  return [text, '', ...lines.slice(range.open)].join('\n')
 }
 
 /** Pulls the first JSON object out of a model reply that may wrap it in a fence. */

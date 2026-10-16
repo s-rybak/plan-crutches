@@ -1,14 +1,9 @@
-import type { Diagram, PlanModel, QaItem, Review, ReviewComment } from '../types'
+import type { Diagram, OkMark, PlanModel, PlanVersion, QaItem, Review, ReviewComment } from '../types'
 import { diagramText } from './diagram'
+import { slugify } from './paths'
 import { describeQaTarget, threadText } from './prompts'
 
-export function slugify(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9Ѐ-ӿ]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48) || 'plan'
-}
+export { slugify }
 
 export function recordFileName(nowMs: number, plan: PlanModel): string {
   const date = new Date(nowMs).toISOString().slice(0, 10)
@@ -30,6 +25,11 @@ function commentLine(comment: ReviewComment): string {
   return `- ${place}${comment.text}${state}`
 }
 
+function versionLine(entry: PlanVersion): string {
+  const how = entry.source === 'restored' ? ` restored from v${entry.from ?? '?'}` : entry.source === 'edited' ? ' edited by the user' : ' received'
+  return `- v${entry.version}${how} ${entry.receivedAt}: ${entry.title}, ${entry.fileCount} files${entry.path ? ` (${entry.path})` : ''}`
+}
+
 /** The Markdown record of a reviewed plan, rewritten whole on every change. */
 export function renderRecord(args: {
   plan: PlanModel
@@ -37,16 +37,20 @@ export function renderRecord(args: {
   comments: readonly ReviewComment[]
   diagram?: Diagram
   qa?: readonly QaItem[]
+  ok?: Readonly<Record<string, OkMark>>
+  versions?: readonly PlanVersion[]
   nowMs: number
 }): string {
   const { plan, review, comments, nowMs } = args
   const qa = args.qa ?? []
+  const ok = args.ok ?? {}
   const out: string[] = []
   out.push(`# ${plan.title}`)
   out.push('')
   out.push(`Status: ${review.status} | Version: ${review.version} | Updated: ${new Date(nowMs).toISOString()}`)
   if (review.planFilePath) out.push(`Plan file: ${review.planFilePath}`)
   out.push(`Structure source: ${review.parsedFrom}`)
+  if (review.summaryEditedInVersion !== undefined) out.push(`Summary edited by the user in v${review.summaryEditedInVersion}`)
   out.push('')
   out.push('## Task')
   out.push('')
@@ -67,10 +71,12 @@ export function renderRecord(args: {
   out.push('')
   if (plan.files.length === 0) out.push('No structured file list.')
   for (const file of plan.files) {
-    out.push(`- [${file.status}] ${file.path}${file.description ? ` — ${file.description}` : ''}`)
+    const mark = ok[file.path] ? ` (OK in v${ok[file.path]?.version})` : ''
+    out.push(`- [${file.status}] ${file.path}${mark}${file.description ? ` — ${file.description}` : ''}`)
     for (const symbol of file.symbols) {
       const signature = symbol.signature.split('\n')[0] ?? symbol.name
-      out.push(`  - \`${signature}\`${symbol.description ? ` — ${symbol.description}` : ''}`)
+      const change = symbol.change && symbol.change !== 'new' ? `[${symbol.change}] ` : ''
+      out.push(`  - ${change}\`${signature}\`${symbol.description ? ` — ${symbol.description}` : ''}`)
     }
   }
   out.push('')
@@ -113,6 +119,12 @@ export function renderRecord(args: {
     out.push('## Warnings')
     out.push('')
     for (const warning of review.warnings) out.push(`- ${warning}`)
+    out.push('')
+  }
+  if (args.versions && args.versions.length) {
+    out.push('## Versions')
+    out.push('')
+    for (const entry of args.versions) out.push(versionLine(entry))
     out.push('')
   }
   out.push('## History')

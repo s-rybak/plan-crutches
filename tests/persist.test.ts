@@ -3,9 +3,24 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { DEMO_PLAN } from '../hooks/demo-plan'
-import { STORED_SHAPE, STORE_INDEX_KEY, buildStored, indexWith, parseIndex, parseStored, storeKey, thawStored } from '../hooks/persist'
+import { bodiesFile, projectDir, reviewFile, versionFile } from '../hooks/paths'
+import {
+  STORED_SHAPE,
+  STORE_INDEX_KEY,
+  buildStored,
+  indexWith,
+  parseBodiesText,
+  parseIndex,
+  parseStored,
+  parseStoredText,
+  serializeBodies,
+  serializeStored,
+  storeKey,
+  thawStored,
+} from '../hooks/persist'
 import type { StoredInput } from '../hooks/persist'
 import { parsePlan } from '../hooks/plan-parser'
+import { parseSavedVersion } from '../hooks/versions'
 import type { StoredIndexEntry } from '../types'
 
 const PANE = {
@@ -23,6 +38,13 @@ const PANE = {
 
 const RUN = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: true, columns: 120 } }
 const HOME = '/tmp/plan-crutches-test-home'
+const CWD = '/work/app'
+const SESSION = 'session-a'
+const PLAN_FILE = `${CWD}/plans/demo-plan.md`
+/** Where the mod keeps this project's review files. */
+const DIR = projectDir(HOME, CWD)
+const REVIEW_FILE = reviewFile(DIR)
+const BODIES_FILE = bodiesFile(DIR)
 
 function demoPlan() {
   const parsed = parsePlan(DEMO_PLAN)
@@ -32,8 +54,8 @@ function demoPlan() {
 
 function input(overrides: Partial<StoredInput> = {}): StoredInput {
   return {
-    cwd: '/work/app',
-    sessionId: 'session-a',
+    cwd: CWD,
+    sessionId: SESSION,
     savedAt: '2026-10-15T10:00:00.000Z',
     plan: demoPlan(),
     review: {
@@ -44,7 +66,7 @@ function input(overrides: Partial<StoredInput> = {}): StoredInput {
       history: ['v1 received', 'v2 received'],
       previousPaths: [],
       planFilePath: '/home/me/.claude/plans/x.md',
-      recordPath: '/work/app/docs/plans/x.md',
+      recordPath: `${DIR}/x.md`,
     },
     comments: [{ id: 'c1', target: { path: 'src/auth/session.ts' }, text: 'Keep it smaller.', createdInVersion: 2 }],
     qa: [
@@ -70,22 +92,26 @@ function input(overrides: Partial<StoredInput> = {}): StoredInput {
       expanded: [],
       pendingSelection: 'sel',
     },
-    bodies: { 'a#b': { status: 'ready', code: 'x' }, 'c#d': { status: 'loading' } },
+    ok: { 'src/auth/user.ts': { version: 2, at: '2026-10-15T10:00:00.000Z' } },
+    versions: [
+      { version: 1, receivedAt: '2026-10-15T09:00:00.000Z', title: 'T', fileCount: 4, source: 'received', path: versionFile(DIR, 1) },
+      { version: 2, receivedAt: '2026-10-15T10:00:00.000Z', title: 'T', fileCount: 5, source: 'received', path: versionFile(DIR, 2) },
+    ],
+    explanations: {
+      e1: { status: 'done', text: 'Because.', target: { path: 'src/auth/session.ts' }, createdInVersion: 2 },
+      e2: { status: 'asking', target: {}, createdInVersion: 2 },
+    },
     token: 'tok',
     ...overrides,
   }
 }
 
-const CWD = '/work/app'
-const SESSION = 'session-a'
-const PLAN_FILE = `${CWD}/plans/demo-plan.md`
-
 /**
  * The world beneath the mod for these tests, registered before the test's
  * first `$` call: a store in memory the test reads and seeds, a fixed folder
  * and session id, a file system that holds the plan file and keeps what the
- * mod writes, and answers for the calls the session start and the plan mode
- * hooks make. Nothing touches the disk.
+ * mod writes (the review files among it), and answers for the calls the
+ * session start and the plan mode hooks make. Nothing touches the disk.
  */
 function beneath(on: On, sessionId = SESSION): { data: Record<string, unknown>; written: Record<string, string> } {
   mock.clock(on)
@@ -122,34 +148,67 @@ function beneath(on: On, sessionId = SESSION): { data: Record<string, unknown>; 
 
 const exitPlanMode = ($: Engine) => ($.tool.call as unknown as (input: { tool: string }) => Promise<unknown>)({ tool: 'ExitPlanMode' })
 
+/** Puts a record and its bodies where the mod reads them, as an earlier process left them. */
+function seed(written: Record<string, string>, data: Record<string, unknown>, record: ReturnType<typeof buildStored>, bodies: Record<string, unknown> = {}): void {
+  written[REVIEW_FILE] = serializeStored(record)
+  written[BODIES_FILE] = JSON.stringify(bodies)
+  data[STORE_INDEX_KEY] = [{ cwd: record.cwd, savedAt: record.savedAt, title: record.plan.title, version: record.review.version, dir: DIR }]
+}
+
+const storedNow = (written: Record<string, string>) => parseStoredText(written[REVIEW_FILE] ?? '')
+
 describe('stored review helpers', () => {
-  test('builds a record with the token and the ready bodies, and drops the bodies when the record would be large', async () => {
+  test('builds a record with the token, the OK marks, the versions and the finished explanations; the bodies have a file of their own', async () => {
     const stored = buildStored(input())
     expect(stored.shape).toBe(STORED_SHAPE)
     expect(stored.token).toBe('tok')
-    expect(Object.keys(stored.bodies ?? {})).toEqual(['a#b'])
-    const big = buildStored(input({ bodies: { 'a#b': { status: 'ready', code: 'x'.repeat(1024 * 1024 + 1) } } }))
-    expect(big.bodies).toBeUndefined()
-    expect(big.comments).toHaveLength(1)
-    const none = buildStored(input({ bodies: {}, token: undefined }))
-    expect(none.bodies).toBeUndefined()
+    expect(stored.bodies).toBeUndefined()
+    expect(Object.keys(stored.ok)).toEqual(['src/auth/user.ts'])
+    expect(stored.versions.map(one => one.version)).toEqual([1, 2])
+    expect(Object.keys(stored.explanations ?? {})).toEqual(['e1'])
+    const none = buildStored(input({ token: undefined, explanations: {} }))
     expect(none.token).toBeUndefined()
+    expect(none.explanations).toBeUndefined()
+    const bodies = serializeBodies({ 'a#b': { status: 'ready', code: 'x' }, 'c#d': { status: 'loading' }, 'e#f': { status: 'ready', code: 'y'.repeat(100) } }, 80)
+    expect(Object.keys(parseBodiesText(bodies))).toEqual(['a#b'])
+    expect(parseBodiesText('not json')).toEqual({})
+    expect(parseBodiesText(serializeBodies({}))).toEqual({})
+  })
+
+  test('a record too large for one read drops its explanations, then its questions, and keeps the comments', async () => {
+    const whole = serializeStored(buildStored(input()))
+    expect(JSON.parse(whole).explanations).toBeDefined()
+    const smaller = JSON.parse(serializeStored(buildStored(input()), whole.length - 1))
+    expect(smaller.explanations).toBeUndefined()
+    expect(smaller.qa.length).toBe(2)
+    const tiny = JSON.parse(serializeStored(buildStored(input()), 100))
+    expect(tiny.qa).toEqual([])
+    expect(tiny.diagram.status).toBe('idle')
+    expect(tiny.comments.map((one: { text: string }) => one.text)).toEqual(['Keep it smaller.'])
   })
 
   test('reads a record back through JSON and refuses what it did not write', async () => {
     const stored = buildStored(input())
     const back = parseStored(JSON.parse(JSON.stringify(stored)))
     expect(back).toEqual(stored)
+    expect(parseStoredText(serializeStored(stored))).toEqual(stored)
+    expect(parseStoredText('{}')).toBe(null)
+    expect(parseStoredText('nope')).toBe(null)
     expect(parseStored(null)).toBe(null)
     expect(parseStored('review')).toBe(null)
     expect(parseStored({ ...stored, shape: STORED_SHAPE + 1 })).toBe(null)
     expect(parseStored({ ...stored, plan: { title: 'x' } })).toBe(null)
     expect(parseStored({ ...stored, review: { status: 'reviewing' } })).toBe(null)
     expect(parseStored({ ...stored, comments: 'none' })).toBe(null)
+    expect(parseStored({ ...stored, ok: 'all' })).toBe(null)
+    // A record without the newer fields still reads: they are empty.
+    const { ok: _ok, versions: _versions, explanations: _explanations, ...older } = stored
+    expect(parseStored(older)?.ok).toEqual({})
+    expect(parseStored(older)?.versions).toEqual([])
   })
 
   test('settles what was still loading when the process died', async () => {
-    const thawed = thawStored(buildStored(input()))
+    const thawed = thawStored(buildStored(input()), { 'a#b': { status: 'ready', code: 'x' }, 'c#d': { status: 'loading' } })
     expect(thawed.plan.title).toBe(demoPlan().title)
     expect(thawed.review.version).toBe(2)
     expect(thawed.comments.map(one => one.text)).toEqual(['Keep it smaller.'])
@@ -159,22 +218,26 @@ describe('stored review helpers', () => {
     expect(Object.keys(thawed.diagram.callers)).toEqual(['c#d'])
     expect(thawed.diagram.status).toBe('ready')
     expect(Object.keys(thawed.bodies)).toEqual(['a#b'])
+    expect(Object.keys(thawed.ok)).toEqual(['src/auth/user.ts'])
+    expect(thawed.versions.length).toBe(2)
+    expect(Object.keys(thawed.explanations)).toEqual(['e1'])
     expect(thawed.ui.lang).toBe('uk')
     expect(thawed.ui.selected).toBe('src/auth/session.ts')
     expect(thawed.ui.commenting).toBeUndefined()
     expect(thawed.ui.pendingSelection).toBeUndefined()
     const loading = thawStored(buildStored(input({ diagram: { status: 'loading', callers: {} } })))
     expect(loading.diagram).toEqual({ status: 'idle', callers: {} })
+    expect(loading.bodies).toEqual({})
   })
 
   test('keeps the index newest first and names the folders it cuts off', async () => {
     const entries: StoredIndexEntry[] = [
-      { cwd: '/b', savedAt: '2026-10-02T00:00:00.000Z', title: 'B', version: 1 },
+      { cwd: '/b', savedAt: '2026-10-02T00:00:00.000Z', title: 'B', version: 1, dir: '/h/b' },
       { cwd: '/a', savedAt: '2026-10-01T00:00:00.000Z', title: 'A', version: 1 },
     ]
     const added = indexWith(entries, { cwd: '/c', savedAt: '2026-10-03T00:00:00.000Z', title: 'C', version: 1 }, 2)
     expect(added.entries.map(one => one.cwd)).toEqual(['/c', '/b'])
-    expect(added.dropped).toEqual(['/a'])
+    expect(added.dropped.map(one => one.cwd)).toEqual(['/a'])
     const replaced = indexWith(entries, { cwd: '/a', savedAt: '2026-10-04T00:00:00.000Z', title: 'A', version: 2 }, 8)
     expect(replaced.entries.map(one => one.cwd)).toEqual(['/a', '/b'])
     expect(replaced.dropped).toEqual([])
@@ -184,10 +247,11 @@ describe('stored review helpers', () => {
 })
 
 describe('the review between processes', () => {
-  test('a live review is written to the store as it changes, and dropped by a reset', async ($, on) => {
+  test('a live review is written to its file as it changes, with its version saved, and dropped by a reset', async ($, on) => {
     const { data: seen, written } = beneath(on)
-    const [cwd, sessionId, planFilePath] = [CWD, SESSION, PLAN_FILE]
-    await $.prompt.attachment({ type: 'plan_mode', origin: { kind: 'engine' }, text: 'Plan mode is on.', detail: { reminder: 'full', planFilePath, hasPlan: true } })
+    // A record from the time the store held it: the mod cleans it up.
+    seen[storeKey(CWD)] = { shape: 1 }
+    await $.prompt.attachment({ type: 'plan_mode', origin: { kind: 'engine' }, text: 'Plan mode is on.', detail: { reminder: 'full', planFilePath: PLAN_FILE, hasPlan: true } })
     await exitPlanMode($)
     const ui = await $.ui.mount({ plugin: 'plan-crutches', surface: 'desktop', ...PANE })
     expect(await ui.find({ text: /Session refresh for the auth module/ })).toBeDefined()
@@ -195,74 +259,85 @@ describe('the review between processes', () => {
     await ui.input({ key: 'input:plan', text: 'Keep it smaller.' })
     expect(await ui.find({ text: /Keep it smaller\./ })).toBeDefined()
     await ui.unmount()
-    const stored = parseStored(seen[storeKey(cwd)])
+    const stored = storedNow(written)
     expect(stored).not.toBe(null)
-    expect(stored?.sessionId).toBe(sessionId)
+    expect(stored?.sessionId).toBe(SESSION)
     expect(stored?.review.status).toBe('reviewing')
     expect(stored?.review.version).toBe(1)
-    expect(stored?.review.planFilePath).toBe(planFilePath)
+    expect(stored?.review.planFilePath).toBe(PLAN_FILE)
     expect(stored?.comments.map(one => one.text)).toEqual(['Keep it smaller.'])
-    expect(parseIndex(seen[STORE_INDEX_KEY]).map(one => one.cwd)).toEqual([cwd])
-    expect(Object.keys(written).some(path => path.startsWith(`${cwd}/docs/plans/`))).toBe(true)
+    expect(stored?.versions.map(one => one.version)).toEqual([1])
+    expect(stored?.versions[0]?.path).toBe(versionFile(DIR, 1))
+    const saved = parseSavedVersion(written[versionFile(DIR, 1)] ?? '')
+    expect(saved?.markdown).toBe(DEMO_PLAN)
+    expect(saved?.plan.title).toBe('Session refresh for the auth module')
+    expect(saved?.source).toBe('received')
+    expect(written[BODIES_FILE]).toBe('{}')
+    expect(parseIndex(seen[STORE_INDEX_KEY]).map(one => one.cwd)).toEqual([CWD])
+    expect(parseIndex(seen[STORE_INDEX_KEY])[0]?.dir).toBe(DIR)
+    expect(seen[storeKey(CWD)]).toBeUndefined()
+    const record = Object.keys(written).find(path => path.startsWith(`${DIR}/`) && path.endsWith('.md'))
+    expect(record).toBeDefined()
+    expect(written[record ?? ''] ?? '').toContain('## Versions')
     await $.command.run({ command: 'plan-review', args: 'reset', ...RUN })
-    expect(seen[storeKey(cwd)]).toBeUndefined()
+    expect(storedNow(written)).toBe(null)
     expect(parseIndex(seen[STORE_INDEX_KEY])).toEqual([])
     const none = await $.command.run({ command: 'plan-review', args: 'restore', ...RUN })
     expect(none.text ?? '').toContain('No stored review')
   })
 
-  test('the same session resumed takes its stored review up at session start', async ($, on) => {
+  test('the same session resumed takes its stored review up at session start, bodies and OK marks included', async ($, on) => {
     const { data: seen, written } = beneath(on)
-    const [cwd, sessionId] = [CWD, SESSION]
-    const record = buildStored(input({ cwd, sessionId, review: { ...input().review, planFilePath: PLAN_FILE, recordPath: `${cwd}/docs/plans/x.md` } }))
-    seen[storeKey(cwd)] = record
-    seen[STORE_INDEX_KEY] = [{ cwd, savedAt: record.savedAt, title: record.plan.title, version: 2 }]
-    await $.session.start({ cwd, surface: 'desktop', isInteractive: true })
+    const record = buildStored(input({ review: { ...input().review, planFilePath: PLAN_FILE, recordPath: `${DIR}/x.md` } }))
+    seed(written, seen, record, { 'a#b': { status: 'ready', code: 'x' } })
+    await $.session.start({ cwd: CWD, surface: 'desktop', isInteractive: true })
     const ui = await $.ui.mount({ plugin: 'plan-crutches', surface: 'desktop', ...PANE })
     expect(await ui.find({ text: /Session refresh for the auth module/ })).toBeDefined()
     expect(await ui.find({ text: /Keep it smaller\./ })).toBeDefined()
     await ui.unmount()
-    const again = parseStored(seen[storeKey(cwd)])
+    const again = storedNow(written)
     expect(again?.review.history.some(line => line.startsWith('restored after a restart'))).toBe(true)
     expect(again?.token).toBe('tok')
-    expect(written[`${cwd}/docs/plans/x.md`] ?? '').toContain('restored after a restart')
+    expect(Object.keys(again?.ok ?? {})).toEqual(['src/auth/user.ts'])
+    expect(again?.versions.length).toBe(2)
+    expect(Object.keys(parseBodiesText(written[BODIES_FILE] ?? ''))).toEqual(['a#b'])
+    expect(written[`${DIR}/x.md`] ?? '').toContain('restored after a restart')
     const live = await $.command.run({ command: 'plan-review', args: 'restore', ...RUN })
     expect(live.text ?? '').toContain('already under review')
     await $.command.run({ command: 'plan-review', args: 'reset', ...RUN })
-    expect(seen[storeKey(cwd)]).toBeUndefined()
+    expect(storedNow(written)).toBe(null)
   })
 
   test('another session is only told, and restores on command', async ($, on) => {
-    const { data: seen } = beneath(on, 'session-b')
-    const cwd = CWD
-    const record = buildStored(input({ cwd, sessionId: SESSION, review: { ...input().review, planFilePath: PLAN_FILE, recordPath: '' } }))
-    seen[storeKey(cwd)] = record
-    await $.session.start({ cwd, surface: 'desktop', isInteractive: true })
+    const { data: seen, written } = beneath(on, 'session-b')
+    const record = buildStored(input({ sessionId: SESSION, review: { ...input().review, planFilePath: PLAN_FILE, recordPath: '' } }))
+    seed(written, seen, record)
+    await $.session.start({ cwd: CWD, surface: 'desktop', isInteractive: true })
     const before = await $.ui.mount({ plugin: 'plan-crutches', surface: 'desktop', ...PANE })
     expect(await before.find({ text: /No plan under review/ })).toBeDefined()
     await before.unmount()
-    expect(parseStored(seen[storeKey(cwd)])?.sessionId).toBe(SESSION)
+    expect(storedNow(written)?.sessionId).toBe(SESSION)
     const ran = await $.command.run({ command: 'plan-review', args: 'restore', ...RUN })
     expect(ran.text ?? '').toContain('plan v2 restored')
     const after = await $.ui.mount({ plugin: 'plan-crutches', surface: 'desktop', ...PANE })
     expect(await after.find({ text: /Session refresh for the auth module/ })).toBeDefined()
     expect(await after.find({ text: /Keep it smaller\./ })).toBeDefined()
     await after.unmount()
+    expect(storedNow(written)?.sessionId).toBe('session-b')
     await $.command.run({ command: 'plan-review', args: 'reset', ...RUN })
-    expect(seen[storeKey(cwd)]).toBeUndefined()
+    expect(storedNow(written)).toBe(null)
   })
 
   test('a stored review whose plan file is gone is reported, not restored', async ($, on) => {
-    const { data: seen } = beneath(on, 'session-b')
-    const cwd = CWD
-    const record = buildStored(input({ cwd, sessionId: SESSION, review: { ...input().review, planFilePath: `${cwd}/plans/no-such-plan.md`, recordPath: '' } }))
-    seen[storeKey(cwd)] = record
+    const { data: seen, written } = beneath(on, 'session-b')
+    const record = buildStored(input({ sessionId: SESSION, review: { ...input().review, planFilePath: `${CWD}/plans/no-such-plan.md`, recordPath: '' } }))
+    seed(written, seen, record)
     const ran = await $.command.run({ command: 'plan-review', args: 'restore', ...RUN })
     expect(ran.text ?? '').toContain('plan file is gone')
-    expect(seen[storeKey(cwd)]).toBeDefined()
+    expect(storedNow(written)).not.toBe(null)
     const demo = await $.command.run({ command: 'plan-review', args: 'demo', ...RUN })
     expect(demo.text ?? '').toContain('demo plan opened')
-    expect(seen[storeKey(cwd)]).toBeUndefined()
+    expect(storedNow(written)).toBe(null)
     await $.command.run({ command: 'plan-review', args: 'reset', ...RUN })
   })
 })

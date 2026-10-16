@@ -4,7 +4,8 @@ import type { On } from 'claude-code'
 import { DEMO_PLAN } from '../hooks/demo-plan'
 import { newestPlanFile, openArgument, resolvePlanPath } from '../hooks/open-plan'
 import type { FolderEntry } from '../hooks/open-plan'
-import { STORE_INDEX_KEY, parseIndex, parseStored, storeKey } from '../hooks/persist'
+import { projectDir, reviewFile } from '../hooks/paths'
+import { STORE_INDEX_KEY, parseIndex, parseStoredText } from '../hooks/persist'
 
 const PANE = {
   component: 'Pane' as const,
@@ -29,6 +30,9 @@ const PLANS_DIR = `${HOME}/.claude/plans`
 const OTHER_PATH = `${PLANS_DIR}/other-plan.md`
 const NEWEST_PATH = `${PLANS_DIR}/newest-plan.md`
 const LOCKED_PATH = `${CWD}/locked.md`
+/** Where the mod keeps this project's review files. */
+const DIR = projectDir(HOME, CWD)
+const storedNow = (written: Record<string, string>) => parseStoredText(written[reviewFile(DIR)] ?? '')
 
 /** The plans folder as the engine lists it: the newest plan last changed, beside an older plan, a folder and a text file. */
 const PLANS: FolderEntry[] = [
@@ -168,7 +172,7 @@ describe('a plan opened from a file', () => {
     await ui.input({ key: 'input:plan', text: 'Keep it smaller.' })
     expect(await ui.find({ text: /Keep it smaller\./ })).toBeDefined()
     await ui.unmount()
-    const stored = parseStored(seen[storeKey(CWD)])
+    const stored = storedNow(written)
     expect(stored).not.toBe(null)
     expect(stored?.sessionId).toBe(SESSION)
     expect(stored?.review.status).toBe('reviewing')
@@ -178,15 +182,16 @@ describe('a plan opened from a file', () => {
     expect(stored?.plan.title).toBe('Session refresh for the auth module')
     expect(stored?.comments.map(one => one.text)).toEqual(['Keep it smaller.'])
     expect(parseIndex(seen[STORE_INDEX_KEY]).map(one => one.cwd)).toEqual([CWD])
-    const recordPath = Object.keys(written).find(path => path.startsWith(`${CWD}/docs/plans/`))
+    const recordPath = Object.keys(written).find(path => path.startsWith(`${DIR}/`) && path.endsWith('.md'))
     expect(recordPath).toBeDefined()
     expect(written[recordPath ?? ''] ?? '').toContain(`Plan file: ${FIXTURE_PATH}`)
+    expect(Object.keys(written).some(path => path.startsWith(`${CWD}/`))).toBe(false)
     await $.command.run({ command: 'plan-review', args: 'reset', ...RUN })
-    expect(seen[storeKey(CWD)]).toBeUndefined()
+    expect(storedNow(written)).toBe(null)
   })
 
   test('the same file again is the next version and keeps the comments; another file starts over', async ($, on) => {
-    const { data: seen } = beneath(on)
+    const { data: seen, written } = beneath(on)
     await $.command.run({ command: 'plan-review', args: `open ${FIXTURE}`, ...RUN })
     const ui = await $.ui.mount({ plugin: 'plan-crutches', surface: 'desktop', ...PANE })
     await ui.press({ key: 'plan-comment' })
@@ -194,13 +199,13 @@ describe('a plan opened from a file', () => {
     await ui.unmount()
     const again = await $.command.run({ command: 'plan-review', args: `open ./${FIXTURE}`, ...RUN })
     expect(again.text ?? '').toContain(`plan v2 opened from ${FIXTURE_PATH}`)
-    let stored = parseStored(seen[storeKey(CWD)])
+    let stored = storedNow(written)
     expect(stored?.review.version).toBe(2)
     expect(stored?.review.history.map(line => line.slice(0, 11))).toEqual(['v1 received', 'v2 received'])
     expect(stored?.comments.map(one => one.text)).toEqual(['Keep it smaller.'])
     const other = await $.command.run({ command: 'plan-review', args: 'open ~/.claude/plans/other-plan.md', ...RUN })
     expect(other.text ?? '').toContain(`plan v1 opened from ${OTHER_PATH}`)
-    stored = parseStored(seen[storeKey(CWD)])
+    stored = storedNow(written)
     expect(stored?.review.version).toBe(1)
     expect(stored?.review.planFilePath).toBe(OTHER_PATH)
     expect(stored?.plan.title).toBe('Rename the greeting')
@@ -210,11 +215,11 @@ describe('a plan opened from a file', () => {
     expect(await pane.find({ key: 'row:file:src/greet.ts' })).toBeDefined()
     await pane.unmount()
     await $.command.run({ command: 'plan-review', args: 'reset', ...RUN })
-    expect(seen[storeKey(CWD)]).toBeUndefined()
+    expect(storedNow(written)).toBe(null)
   })
 
   test('refuses a missing, unreadable or unnamed file and keeps the live review', async ($, on) => {
-    const { data: seen } = beneath(on)
+    const { data: seen, written } = beneath(on)
     await $.command.run({ command: 'plan-review', args: `open ${FIXTURE}`, ...RUN })
     const missing = await $.command.run({ command: 'plan-review', args: 'open plans/no-such-plan.md', ...RUN })
     expect(missing.text ?? '').toContain(`no file at ${CWD}/plans/no-such-plan.md`)
@@ -222,40 +227,40 @@ describe('a plan opened from a file', () => {
     expect(cased.text ?? '').toContain(`no file at ${CWD}/Fixtures/Demo-Plan.md`)
     const locked = await $.command.run({ command: 'plan-review', args: 'open locked.md', ...RUN })
     expect(locked.text ?? '').toContain(`could not read ${LOCKED_PATH}`)
-    const stored = parseStored(seen[storeKey(CWD)])
+    const stored = storedNow(written)
     expect(stored?.review.version).toBe(1)
     expect(stored?.review.planFilePath).toBe(FIXTURE_PATH)
     await $.command.run({ command: 'plan-review', args: 'reset', ...RUN })
-    expect(seen[storeKey(CWD)]).toBeUndefined()
+    expect(storedNow(written)).toBe(null)
   })
 })
 
 describe('a plan found without a path', () => {
   test('with nothing under review, opens the newest plan file of the plans folder', async ($, on) => {
-    const { data: seen } = beneath(on)
+    const { data: seen, written } = beneath(on)
     const ran = await $.command.run({ command: 'plan-review', args: 'open', ...RUN })
     expect(ran.text ?? '').toContain(`plan v1 opened from ${NEWEST_PATH}, the newest file under ~/.claude/plans`)
-    const stored = parseStored(seen[storeKey(CWD)])
+    const stored = storedNow(written)
     expect(stored?.review.planFilePath).toBe(NEWEST_PATH)
     expect(stored?.plan.title).toBe('Add a logout button')
     await $.command.run({ command: 'plan-review', args: 'reset', ...RUN })
-    expect(seen[storeKey(CWD)]).toBeUndefined()
+    expect(storedNow(written)).toBe(null)
   })
 
   test('opens the plan file plan mode named, not the newest one', async ($, on) => {
-    const { data: seen } = beneath(on)
+    const { data: seen, written } = beneath(on)
     await $.prompt.attachment({ type: 'plan_mode', origin: { kind: 'engine' }, text: 'Plan mode is on.', detail: { reminder: 'full', planFilePath: OTHER_PATH, hasPlan: true } })
     const ran = await $.command.run({ command: 'plan-review', args: 'OPEN', ...RUN })
     expect(ran.text ?? '').toContain(`plan v1 opened from ${OTHER_PATH}, the plan file of this session`)
-    const stored = parseStored(seen[storeKey(CWD)])
+    const stored = storedNow(written)
     expect(stored?.review.planFilePath).toBe(OTHER_PATH)
     expect(stored?.plan.title).toBe('Rename the greeting')
     await $.command.run({ command: 'plan-review', args: 'reset', ...RUN })
-    expect(seen[storeKey(CWD)]).toBeUndefined()
+    expect(storedNow(written)).toBe(null)
   })
 
   test('the file of the live review comes first and keeps the comments; the file plan mode names becomes the next version', async ($, on) => {
-    const { data: seen } = beneath(on)
+    const { data: seen, written } = beneath(on)
     await $.command.run({ command: 'plan-review', args: `open ${FIXTURE}`, ...RUN })
     const ui = await $.ui.mount({ plugin: 'plan-crutches', surface: 'desktop', ...PANE })
     await ui.press({ key: 'plan-comment' })
@@ -263,26 +268,26 @@ describe('a plan found without a path', () => {
     await ui.unmount()
     const again = await $.command.run({ command: 'plan-review', args: 'open', ...RUN })
     expect(again.text ?? '').toContain(`plan v2 opened from ${FIXTURE_PATH}, the plan file of this session`)
-    let stored = parseStored(seen[storeKey(CWD)])
+    let stored = storedNow(written)
     expect(stored?.review.version).toBe(2)
     expect(stored?.comments.map(one => one.text)).toEqual(['Keep it smaller.'])
     // Plan mode names another file: as with ExitPlanMode, it is the next version of the live review.
     await $.prompt.attachment({ type: 'plan_mode', origin: { kind: 'engine' }, text: 'Plan mode is on.', detail: { reminder: 'sparse', planFilePath: OTHER_PATH, hasPlan: true } })
     const other = await $.command.run({ command: 'plan-review', args: 'open', ...RUN })
     expect(other.text ?? '').toContain(`plan v3 opened from ${OTHER_PATH}, the plan file of this session`)
-    stored = parseStored(seen[storeKey(CWD)])
+    stored = storedNow(written)
     expect(stored?.review.version).toBe(3)
     expect(stored?.plan.title).toBe('Rename the greeting')
     expect(stored?.comments.map(one => one.text)).toEqual(['Keep it smaller.'])
     await $.command.run({ command: 'plan-review', args: 'reset', ...RUN })
-    expect(seen[storeKey(CWD)]).toBeUndefined()
+    expect(storedNow(written)).toBe(null)
   })
 
   test('says so when there is no plan to find', async ($, on) => {
-    const { data: seen } = beneath(on, [])
+    const { data: seen, written } = beneath(on, [])
     const none = await $.command.run({ command: 'plan-review', args: 'open', ...RUN })
     expect(none.text ?? '').toContain('no plan found')
     expect(none.text ?? '').toContain('/plan-review open <path>')
-    expect(seen[storeKey(CWD)]).toBeUndefined()
+    expect(storedNow(written)).toBe(null)
   })
 })

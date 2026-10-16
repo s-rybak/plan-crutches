@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { QaItem } from '../types'
 import { DEMO_PLAN } from '../hooks/demo-plan'
 import { parsePlan } from '../hooks/plan-parser'
-import { askMorePrompt, askPrompt, bodyPrompt, importCandidates, parseFileList, pickFilesPrompt, planSurface, relativeImports, threadText } from '../hooks/prompts'
+import { approvePrompt, askMorePrompt, askPrompt, bodyPrompt, explainPrompt, importCandidates, parseFileList, pickFilesPrompt, planSurface, relativeImports, revisionPrompt, threadText } from '../hooks/prompts'
 import { renderRecord } from '../hooks/record'
 
 function demoPlan() {
@@ -52,7 +52,7 @@ describe('prompts', () => {
     expect(rest).not.toContain('isExpiringSoon(session: Session, now: number, marginMs = 60_000): boolean {\n')
     expect(rest).toContain('src/auth/storage.ts (imported by src/auth/user.ts)')
     expect(rest).toContain('Current content of src/auth/user.ts')
-    expect(rest.indexOf('Implement this symbol')).toBeGreaterThan(rest.indexOf('Current content of src/auth/user.ts'))
+    expect(rest.indexOf('Modify this existing symbol')).toBeGreaterThan(rest.indexOf('Current content of src/auth/user.ts'))
     expect(planSurface(plan, 200).length).toBeLessThan(260)
   })
 
@@ -97,6 +97,48 @@ describe('prompts', () => {
     expect(more).toContain('All planned files and symbols:')
     expect(more.endsWith('User: What about eviction?')).toBe(true)
     expect(threadText(THREAD)).toBe('Q: Why a cache?\nA: So parallel callers share one request.\nQ: Per process only?\nA: Yes, Redis comes later.')
+  })
+
+  test('a modified symbol asks for its whole new implementation next to its code today; the surface names the change', async () => {
+    const plan = demoPlan()
+    const file = plan.files.find(one => one.path === 'src/auth/user.ts')!
+    const symbol = file.symbols.find(one => one.name === 'getCurrentUser')!
+    expect(symbol.change).toBe('modified')
+    const blocks = bodyPrompt({ plan, file, symbol, fileText: 'x', bodies: {}, related: [], currentCode: 'export async function getCurrentUser() { return old }' })
+    expect(blocks[0]!.text).toContain('[function, modified] getCurrentUser')
+    expect(blocks[0]!.text).toContain('[function, deleted] displayNameOf')
+    expect(blocks[1]!.text).toContain('Modify this existing symbol')
+    expect(blocks[1]!.text).toContain('Its code today, which your implementation replaces:')
+    expect(blocks[1]!.text).toContain('return old')
+    expect(blocks[1]!.text).toContain('- export function displayNameOf(user: User): string { (deleted)')
+  })
+
+  test('the explanation prompt names the place, the planned symbol, the file text and the language', async () => {
+    const plan = demoPlan()
+    const prompt = explainPrompt(plan, { path: 'src/auth/user.ts', symbol: 'getCurrentUser', lines: [3, 5], selection: 'readSession()' }, undefined, 'export function x() {}', 'uk')
+    expect(prompt).toContain('Answer in Ukrainian')
+    expect(prompt).toContain('What, Where and Why')
+    expect(prompt).toContain('The place to explain: src/auth/user.ts, symbol getCurrentUser, lines 3-5.')
+    expect(prompt).toContain('Planned symbol getCurrentUser [function, modified]:')
+    expect(prompt).toContain('Current content of src/auth/user.ts:\n```\nexport function x() {}')
+    expect(prompt).toContain('readSession()')
+    expect(prompt).toContain('All planned files and symbols:')
+    const whole = explainPrompt(plan, {}, 'src/auth/session.ts')
+    expect(whole).toContain('Answer in English')
+    expect(whole).toContain('The place to explain: src/auth/session.ts.')
+    expect(whole).not.toContain('Current content of')
+  })
+
+  test('the revision and approval prompts carry the OK marks and the summary edit', async () => {
+    const plan = demoPlan()
+    const comments = [{ id: '1', target: {}, text: 'Keep it smaller.', createdInVersion: 2 }]
+    const revision = revisionPrompt(plan, comments, 2, { okPaths: ['src/legacy/tokens.ts'], summaryEdited: true })
+    expect(revision).toContain('The user edited the plan text (the summary) directly in the plan file.')
+    expect(revision).toContain('Files the user marked as reviewed OK')
+    expect(revision).toContain('- src/legacy/tokens.ts')
+    expect(revisionPrompt(plan, comments, 2)).not.toContain('reviewed OK')
+    expect(approvePrompt(2)).toContain('Call ExitPlanMode now')
+    expect(approvePrompt(2, { summaryEdited: true })).toContain('Read the plan file again')
   })
 
   test('the record lists answered questions with their context', async () => {

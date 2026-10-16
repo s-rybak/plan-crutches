@@ -52,11 +52,14 @@ const EMPTY_STATE = {
   qa: [],
   diagram: { status: 'idle', callers: {} },
   files: {},
+  ok: {},
+  explanations: {},
+  versions: [],
   lang: 'en',
   summaryLimit: 9000,
   cwd: PROJECT_DIR,
   generatedAt: new Date().toISOString(),
-  protocol: 3,
+  protocol: 4,
 }
 
 let state = EMPTY_STATE
@@ -272,6 +275,79 @@ function handleDemoAction(action) {
       const pending = state.comments.filter(one => one.sentInVersion === undefined && one.resolvedInVersion === undefined)
       noticeCounter += 1
       state.notice = { id: noticeCounter, text: pending.length ? `Demo: ${pending.length} comments would go to Claude as a revision request.` : 'Demo: the plan would be approved.' }
+      break
+    }
+    case 'setOk': {
+      const marks = { ...(state.ok || {}) }
+      const files = state.plan ? state.plan.files.map(file => file.path) : []
+      for (const path of action.paths || [action.path]) {
+        const targets = typeof path === 'string' && path.endsWith('/') ? files.filter(one => one.startsWith(path)) : files.filter(one => one === path)
+        for (const target of targets) {
+          if (action.ok === false) delete marks[target]
+          else marks[target] = { version: state.review.version, at: now() }
+        }
+      }
+      state.ok = marks
+      break
+    }
+    case 'explain': {
+      const key = typeof action.id === 'string' ? action.id : id()
+      state.explanations = { ...(state.explanations || {}), [key]: { status: 'asking', target: action.target || {}, createdInVersion: state.review.version } }
+      setTimeout(() => {
+        const target = action.target || {}
+        const where = target.path ? `${target.path}${target.symbol ? ` · ${target.symbol}` : ''}` : 'the whole plan'
+        const text =
+          `**What.** A demo explanation of ${where}. In the real flow Claude reads the plan and the project and answers here.\n\n` +
+          `**Where.** The place sits in the planned change of ${target.path || 'the plan'}; the callers and dependents come from the code.\n\n` +
+          `**Why.** The plan makes this change for the task it serves; the real answer names what would break without it.` +
+          (target.selection ? `\n\nSelected text: _${String(target.selection).slice(0, 120).replace(/\s+/g, ' ')}_` : '')
+        state.explanations = { ...(state.explanations || {}), [key]: { ...(state.explanations || {})[key], status: 'done', text } }
+        state.generatedAt = now()
+        broadcast()
+      }, 900)
+      break
+    }
+    case 'editSummary': {
+      if (!state.plan || typeof action.text !== 'string') break
+      state.plan = { ...state.plan, summary: action.text }
+      if (state.demoPlans) state.demoPlans[String(state.review.version)] = state.plan
+      state.versions = (state.versions || []).map(one => (one.version === state.review.version ? { ...one, source: 'edited' } : one))
+      state.review = { ...state.review, summaryEditedInVersion: state.review.version, history: [...state.review.history, `v${state.review.version} summary edited by the user (demo)`] }
+      break
+    }
+    case 'viewVersion': {
+      const plans = state.demoPlans || {}
+      const wanted = action.version
+      if (wanted === null || wanted === undefined || wanted === state.review.version || !plans[String(wanted)]) delete state.viewing
+      else state.viewing = { version: wanted, plan: plans[String(wanted)], files: state.files }
+      break
+    }
+    case 'compareWith': {
+      const plans = state.demoPlans || {}
+      const wanted = action.version
+      if (wanted === null || wanted === undefined || !plans[String(wanted)]) delete state.compare
+      else state.compare = { version: wanted, plan: plans[String(wanted)] }
+      break
+    }
+    case 'restoreVersion': {
+      const plans = state.demoPlans || {}
+      const plan = plans[String(action.version)]
+      if (!plan || action.version === state.review.version) break
+      const previous = state.plan
+      const next = state.review.version + 1
+      state.plan = plan
+      plans[String(next)] = plan
+      state.demoPlans = plans
+      const { summaryEditedInVersion: _edited, ...review } = state.review
+      state.review = { ...review, version: next, history: [...state.review.history, `v${next} restored from v${action.version} (demo)`] }
+      state.versions = [...(state.versions || []), { version: next, receivedAt: now(), title: plan.title, fileCount: plan.files.length, source: 'restored', from: action.version, path: '' }]
+      state.compare = previous ? { version: next - 1, plan: previous } : undefined
+      state.ok = {}
+      state.explanations = {}
+      delete state.viewing
+      for (const file of plan.files) if (!state.files[file.path]) state.files[file.path] = { loaded: true, missing: true }
+      noticeCounter += 1
+      state.notice = { id: noticeCounter, text: `Demo: v${next} is v${action.version} brought back.` }
       break
     }
     default:

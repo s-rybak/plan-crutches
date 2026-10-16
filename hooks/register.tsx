@@ -6,19 +6,25 @@ import type {
   CommentTarget,
   Diagram,
   DiagramRef,
+  Explanation,
   FileCache,
   GeneratedBody,
   Lang,
+  LoadedVersion,
+  OkMark,
   ParsedFrom,
   PlanFile,
   PlanModel,
   PlanSymbol,
+  PlanVersion,
   QaItem,
   Review,
   ReviewComment,
+  SavedVersion,
   StoredReview,
   TaskCapture,
   UiState,
+  VersionSource,
   WebNotice,
   WebSnapshot,
   WebState,
@@ -43,10 +49,11 @@ import {
   parseGrepOutput,
 } from './diagram'
 import type { CallerCandidate } from './diagram'
-import { codeFromReply } from './diff'
-import { extractJson, normalizePlan, parsePlan, planFromMarkdown, titleFromMarkdown } from './plan-parser'
+import { codeFromReply, currentSymbolText } from './diff'
+import { applySummary, extractJson, normalizePlan, parsePlan, planFromMarkdown, titleFromMarkdown } from './plan-parser'
 import { renderPane, withoutKeys } from './pane'
 import type { PaneActions, PaneModel } from './pane'
+import { bodiesFile, projectDir, recordsDir, reviewFile, versionFile } from './paths'
 import type { SelectableProps } from './select'
 import {
   BODY_SYSTEM,
@@ -59,6 +66,7 @@ import {
   askPrompt,
   bodyPrompt,
   denyMessage,
+  explainPrompt,
   extractionPrompt,
   importCandidates,
   parseFileList,
@@ -71,8 +79,23 @@ import { t } from './i18n'
 import { newestPlanFile, openArgument, planSourceNote, resolvePlanPath } from './open-plan'
 import type { FoundPlan } from './open-plan'
 import { recordFileName, renderRecord } from './record'
-import { STORE_INDEX_KEY, STORE_KEEP, buildStored, indexWith, indexWithout, isRestorable, parseIndex, parseStored, storeKey, thawStored } from './persist'
+import {
+  STORE_INDEX_KEY,
+  STORE_KEEP,
+  buildStored,
+  indexWith,
+  indexWithout,
+  isRestorable,
+  parseBodiesText,
+  parseIndex,
+  parseStoredText,
+  serializeBodies,
+  serializeStored,
+  storeKey,
+  thawStored,
+} from './persist'
 import { PANE_ID, bodyKey, newId } from './state'
+import { buildSavedVersion, keepOkMarks, parseSavedVersion, pathsUnderFolder, serializeVersion, versionEntry } from './versions'
 import { buildSnapshot, openCommands, pageUrl, parseAction, parseServerLine, parseTarget, splitLines } from './web'
 import type { WebAction } from './web'
 
@@ -158,6 +181,31 @@ const webAtom = atom<'plan-crutches', 'web'>(
   {} as WebState,
 )
 
+const okAtom = atom<'plan-crutches', 'ok'>(
+  { plugin: 'plan-crutches', key: 'ok' } as const,
+  {} as Record<string, OkMark>,
+)
+
+const explainAtom = atom<'plan-crutches', 'explanations'>(
+  { plugin: 'plan-crutches', key: 'explanations' } as const,
+  {} as Record<string, Explanation>,
+)
+
+const versionsAtom = atom<'plan-crutches', 'versions'>(
+  { plugin: 'plan-crutches', key: 'versions' } as const,
+  [] as PlanVersion[],
+)
+
+const compareAtom = atom<'plan-crutches', 'compare'>(
+  { plugin: 'plan-crutches', key: 'compare' } as const,
+  null as LoadedVersion | null,
+)
+
+const viewingAtom = atom<'plan-crutches', 'viewing'>(
+  { plugin: 'plan-crutches', key: 'viewing' } as const,
+  null as LoadedVersion | null,
+)
+
 const PANE_TITLE = 'Plan Review'
 const SERVER_START_MS = 8000
 const SERVER_IDLE_MS = 600_000
@@ -169,8 +217,8 @@ function readOptions(raw: PluginOptions): Options {
   const language = raw.language === 'uk' ? 'uk' : 'en'
   const model = typeof raw.model === 'string' && raw.model.trim() ? raw.model.trim() : 'sonnet'
   const bodyModel = typeof raw.bodyModel === 'string' && raw.bodyModel.trim() ? raw.bodyModel.trim() : 'opus'
-  const plansDir =
-    typeof raw.plansDir === 'string' && raw.plansDir.trim() ? raw.plansDir.trim().replace(/^\/+|\/+$/g, '') : 'docs/plans'
+  // Empty, `~/...` or absolute: the shared folder with one subfolder per project. Anything else: a folder inside the project.
+  const plansDir = typeof raw.plansDir === 'string' ? raw.plansDir.trim().replace(/\/+$/, '') : ''
   const summaryLimit = typeof raw.summaryLimit === 'number' && raw.summaryLimit > 200 ? Math.floor(raw.summaryLimit) : 9000
   const port = typeof raw.port === 'number' && raw.port >= 0 && raw.port <= 65535 ? Math.floor(raw.port) : 4817
   const openIn: OpenIn = raw.openIn === 'system' || raw.openIn === 'none' ? raw.openIn : 'auto'
@@ -184,7 +232,7 @@ function freshUi(previous: UiState): UiState {
   return { lang: previous.lang, tab: 'changes', view: 'tree', collapsed: [], showFullSummary: false, showTask: true, expanded: [] }
 }
 
-let options: Options = { language: 'en', model: 'sonnet', bodyModel: 'opus', plansDir: 'docs/plans', summaryLimit: 9000, port: 4817, openIn: 'auto', nodePath: '' }
+let options: Options = { language: 'en', model: 'sonnet', bodyModel: 'opus', plansDir: '', summaryLimit: 9000, port: 4817, openIn: 'auto', nodePath: '' }
 
 // ---- the review page server -------------------------------------------------
 
@@ -207,9 +255,17 @@ function makeToken(): string {
   return `${newId()}${newId()}${newId()}${newId()}`
 }
 
+async function homeDir($: EngineInterface): Promise<string> {
+  try {
+    return (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
+  } catch {
+    return ''
+  }
+}
+
 async function findNode($: EngineInterface): Promise<string> {
   if (options.nodePath) return options.nodePath
-  const home = (await $.env.get('HOME')) ?? ''
+  const home = await homeDir($)
   const candidates = ['node', '/opt/homebrew/bin/node', '/usr/local/bin/node', `${home}/.volta/bin/node`, '/usr/bin/node']
   const nvmDir = `${home}/.nvm/versions/node`
   try {
@@ -379,7 +435,7 @@ async function pingServer($: EngineInterface): Promise<boolean> {
 }
 
 async function buildWebSnapshot($: EngineInterface): Promise<WebSnapshot> {
-  const [plan, review, comments, ui, bodies, qa, diagram, files] = await Promise.all([
+  const [plan, review, comments, ui, bodies, qa, diagram, files, ok, explanations, versions, compare, viewing] = await Promise.all([
     read($, planAtom),
     read($, reviewAtom),
     read($, commentsAtom),
@@ -388,6 +444,11 @@ async function buildWebSnapshot($: EngineInterface): Promise<WebSnapshot> {
     read($, qaAtom),
     read($, diagramAtom),
     read($, filesAtom),
+    read($, okAtom),
+    read($, explainAtom),
+    read($, versionsAtom),
+    read($, compareAtom),
+    read($, viewingAtom),
   ])
   let cwd = ''
   try {
@@ -403,6 +464,11 @@ async function buildWebSnapshot($: EngineInterface): Promise<WebSnapshot> {
     qa,
     diagram,
     files,
+    ok,
+    explanations,
+    versions,
+    compare,
+    viewing,
     lang: ui.lang,
     summaryLimit: options.summaryLimit,
     cwd,
@@ -445,10 +511,12 @@ function changed($: EngineInterface): void {
 }
 
 // ---- the review between processes ------------------------------------------
-// The session state dies with the process. A live review is also written to
-// the plugin store, keyed by the project folder: the same session resumed
-// takes it up on its own, another session in the folder by /plan-review restore.
-// The store work runs one job at a time, in the order it was asked.
+// The session state dies with the process. A live review is also written to a
+// JSON file under the mod's folder in the Claude configuration directory, one
+// subfolder per project (hooks/paths.ts): the same session resumed takes it up
+// on its own, another session in the folder by /plan-review restore. The
+// plugin store holds only the index of folders. The store work runs one job
+// at a time, in the order it was asked.
 
 let storeChain: Promise<void> = Promise.resolve()
 let syncQueued = false
@@ -469,7 +537,13 @@ async function currentSessionId($: EngineInterface): Promise<string> {
   }
 }
 
-/** Writes the review to the store after the running job; one write serves every call made meanwhile. */
+/** The folder of this project's review files, or empty when the home or the project folder is unknown. */
+async function reviewDir($: EngineInterface): Promise<string> {
+  const [home, cwd] = await Promise.all([homeDir($), sessionCwd($)])
+  return home && cwd ? projectDir(home, cwd) : ''
+}
+
+/** Writes the review to its file after the running job; one write serves every call made meanwhile. */
 function syncStore($: EngineInterface): void {
   if (syncQueued) return
   syncQueued = true
@@ -481,12 +555,12 @@ async function syncJob($: EngineInterface): Promise<void> {
   try {
     await writeStore($)
   } catch (error) {
-    $.ui.log(`plan-crutches: could not write the review to the store: ${String(error)}`, { to: 'debug' })
+    $.ui.log(`plan-crutches: could not write the review file: ${String(error)}`, { to: 'debug' })
   }
 }
 
 async function writeStore($: EngineInterface): Promise<void> {
-  const [plan, review, comments, qa, diagram, task, ui, bodies, web] = await Promise.all([
+  const [plan, review, comments, qa, diagram, task, ui, bodies, web, ok, versions, explanations] = await Promise.all([
     read($, planAtom),
     read($, reviewAtom),
     read($, commentsAtom),
@@ -496,17 +570,24 @@ async function writeStore($: EngineInterface): Promise<void> {
     read($, uiAtom),
     read($, bodiesAtom),
     read($, webAtom),
+    read($, okAtom),
+    read($, versionsAtom),
+    read($, explainAtom),
   ])
   if (!plan || review.isDemo || !isRestorable(review)) return
   const cwd = await sessionCwd($)
-  if (!cwd) return
+  const dir = await reviewDir($)
+  if (!cwd || !dir) return
   const savedAt = await isoNow($)
   const sessionId = await currentSessionId($)
-  const stored = buildStored({ cwd, sessionId, savedAt, plan, review, comments, qa, diagram, task, ui, bodies, ...(web.token ? { token: web.token } : {}) })
-  const index = indexWith(parseIndex(await $.store.get(STORE_INDEX_KEY)), { cwd, savedAt, title: plan.title, version: review.version }, STORE_KEEP)
-  for (const dropped of index.dropped) await $.store.delete(storeKey(dropped))
-  await $.store.set(storeKey(cwd), stored)
+  const stored = buildStored({ cwd, sessionId, savedAt, plan, review, comments, qa, diagram, task, ui, ok, versions, explanations, ...(web.token ? { token: web.token } : {}) })
+  await $.fs.write(reviewFile(dir), serializeStored(stored))
+  await $.fs.write(bodiesFile(dir), serializeBodies(bodies))
+  const index = indexWith(parseIndex(await $.store.get(STORE_INDEX_KEY)), { cwd, savedAt, title: plan.title, version: review.version, dir }, STORE_KEEP)
   await $.store.set(STORE_INDEX_KEY, index.entries)
+  // The record once lived in the store itself; that copy only takes room now.
+  const legacy = storeKey(cwd)
+  if ((await $.store.keys()).includes(legacy)) await $.store.delete(legacy)
 }
 
 /** Drops this folder's stored review after the running job: the review ended or was reset. */
@@ -518,9 +599,12 @@ function clearStore($: EngineInterface): Promise<void> {
 async function deleteStore($: EngineInterface): Promise<void> {
   try {
     const cwd = await sessionCwd($)
+    const dir = await reviewDir($)
     if (!cwd) return
-    const key = storeKey(cwd)
-    if ((await $.store.keys()).includes(key)) await $.store.delete(key)
+    // The file system API has no delete: an empty record is no record.
+    if (dir && (await $.fs.exists(reviewFile(dir)))) await $.fs.write(reviewFile(dir), '{}')
+    const legacy = storeKey(cwd)
+    if ((await $.store.keys()).includes(legacy)) await $.store.delete(legacy)
     const index = parseIndex(await $.store.get(STORE_INDEX_KEY))
     if (index.some(entry => entry.cwd === cwd)) await $.store.set(STORE_INDEX_KEY, indexWithout(index, cwd))
   } catch (error) {
@@ -528,13 +612,20 @@ async function deleteStore($: EngineInterface): Promise<void> {
   }
 }
 
-/** This folder's stored review, when the store holds one this code can read. */
-async function readStored($: EngineInterface): Promise<StoredReview | null> {
+type StoredFound = { stored: StoredReview; bodies: Record<string, GeneratedBody> }
+
+/** This folder's stored review, when its file holds one this code can read. */
+async function readStored($: EngineInterface): Promise<StoredFound | null> {
   try {
-    const cwd = await sessionCwd($)
-    if (!cwd) return null
-    const stored = parseStored(await $.store.get(storeKey(cwd)))
-    return stored && isRestorable(stored.review) ? stored : null
+    const dir = await reviewDir($)
+    if (!dir) return null
+    const file = reviewFile(dir)
+    if (!(await $.fs.exists(file))) return null
+    const stored = parseStoredText(await $.fs.read(file))
+    if (!stored || !isRestorable(stored.review)) return null
+    const bodiesPath = bodiesFile(dir)
+    const bodies = (await $.fs.exists(bodiesPath)) ? parseBodiesText(await $.fs.read(bodiesPath)) : {}
+    return { stored, bodies }
   } catch (error) {
     $.ui.log(`plan-crutches: could not read the stored review: ${String(error)}`, { to: 'debug' })
     return null
@@ -542,11 +633,13 @@ async function readStored($: EngineInterface): Promise<StoredReview | null> {
 }
 
 /** Takes a stored review up in this process; `gone` when its plan file is no longer there. */
-async function restoreReview($: EngineInterface, stored: StoredReview): Promise<'restored' | 'gone'> {
+async function restoreReview($: EngineInterface, found: StoredFound): Promise<'restored' | 'gone'> {
+  const { stored } = found
   const planFilePath = stored.review.planFilePath
   if (!planFilePath || !(await $.fs.exists(planFilePath))) return 'gone'
   const now = await isoNow($)
-  const thawed = thawStored(stored)
+  const thawed = thawStored(stored, found.bodies)
+  versionCache.clear()
   await update($, planAtom, () => thawed.plan)
   await update($, reviewAtom, () => ({ ...thawed.review, history: [...thawed.review.history, `restored after a restart ${now}`] }))
   await update($, commentsAtom, () => thawed.comments)
@@ -556,6 +649,12 @@ async function restoreReview($: EngineInterface, stored: StoredReview): Promise<
   await update($, uiAtom, () => thawed.ui)
   await update($, bodiesAtom, () => thawed.bodies)
   await update($, filesAtom, () => ({}))
+  await update($, okAtom, () => thawed.ok)
+  await update($, versionsAtom, () => thawed.versions)
+  await update($, explainAtom, () => thawed.explanations)
+  await update($, viewingAtom, () => null)
+  const previous = thawed.review.version > 1 ? await loadVersion($, thawed.review.version - 1) : undefined
+  await update($, compareAtom, () => (previous ? { version: previous.version, plan: previous.plan } : null))
   // The stored token lets the page the person left open reconnect; a server
   // already running keeps the token it was started with.
   const token = stored.token
@@ -596,6 +695,119 @@ async function openWeb($: EngineInterface, open: boolean): Promise<string | unde
   return url
 }
 
+// ---- plan versions ----------------------------------------------------------
+// Every version of the plan is kept: its file as received and the plan read
+// from it, one JSON file per version under the project's review folder. The
+// page lists them, shows an earlier one, compares the current plan with one,
+// and brings one back as the next version.
+
+const versionCache = new Map<number, SavedVersion>()
+
+/** Writes a version to its file (not for the demo) and returns the row the state keeps. */
+async function saveVersion($: EngineInterface, saved: SavedVersion, isDemo: boolean): Promise<PlanVersion> {
+  versionCache.set(saved.version, saved)
+  let path = ''
+  if (!isDemo) {
+    const dir = await reviewDir($)
+    if (dir) {
+      path = versionFile(dir, saved.version)
+      try {
+        await $.fs.write(path, serializeVersion(saved))
+      } catch (error) {
+        $.ui.log(`plan-crutches: could not write ${path}: ${String(error)}`, { to: 'debug' })
+        path = ''
+      }
+    }
+  }
+  return versionEntry(saved, path)
+}
+
+/** A saved version, from this process's memory or from its file. */
+async function loadVersion($: EngineInterface, version: number): Promise<SavedVersion | undefined> {
+  const cached = versionCache.get(version)
+  if (cached) return cached
+  const entry = (await read($, versionsAtom)).find(one => one.version === version)
+  if (!entry || !entry.path) return undefined
+  try {
+    if (!(await $.fs.exists(entry.path))) return undefined
+    const saved = parseSavedVersion(await $.fs.read(entry.path))
+    if (saved) versionCache.set(version, saved)
+    return saved ?? undefined
+  } catch (error) {
+    $.ui.log(`plan-crutches: could not read ${entry.path}: ${String(error)}`, { to: 'debug' })
+    return undefined
+  }
+}
+
+async function viewVersion($: EngineInterface, version: number | null): Promise<void> {
+  const review = await read($, reviewAtom)
+  if (version === null || version === review.version) {
+    await update($, viewingAtom, () => null)
+    changed($)
+    return
+  }
+  const saved = await loadVersion($, version)
+  if (!saved) {
+    setNotice(`Version ${version} is not available.`)
+    changed($)
+    return
+  }
+  await update($, viewingAtom, () => ({ version: saved.version, plan: saved.plan }))
+  changed($)
+}
+
+async function compareWith($: EngineInterface, version: number | null): Promise<void> {
+  if (version === null) {
+    await update($, compareAtom, () => null)
+    changed($)
+    return
+  }
+  const saved = await loadVersion($, version)
+  if (!saved) {
+    setNotice(`Version ${version} is not available.`)
+    changed($)
+    return
+  }
+  await update($, compareAtom, () => ({ version: saved.version, plan: saved.plan }))
+  changed($)
+}
+
+/** Brings an earlier version back as the next version: its plan file text is written again and received anew. */
+async function restoreVersion($: EngineInterface, version: number): Promise<void> {
+  const [plan, review] = await Promise.all([read($, planAtom), read($, reviewAtom)])
+  if (!plan || review.status !== 'reviewing') {
+    setNotice(review.status === 'revising' ? 'Claude is revising the plan; a version can come back once the new version has arrived.' : 'No plan is under review.')
+    changed($)
+    return
+  }
+  if (version === review.version) return
+  const saved = await loadVersion($, version)
+  if (!saved) {
+    setNotice(`Version ${version} is not available.`)
+    changed($)
+    return
+  }
+  if (!review.isDemo && review.planFilePath) {
+    try {
+      await $.fs.write(review.planFilePath, saved.markdown)
+    } catch (error) {
+      setNotice(`Could not write the plan file: ${String(error)}`)
+      changed($)
+      return
+    }
+  }
+  const next = await receivePlan($, {
+    markdown: saved.markdown,
+    ...(review.planFilePath ? { planFilePath: review.planFilePath } : {}),
+    isDemo: Boolean(review.isDemo),
+    prebuilt: { plan: saved.plan, parsedFrom: saved.parsedFrom, warnings: saved.warnings },
+    source: 'restored',
+    from: version,
+  })
+  setNotice(`Version ${next} is version ${version} brought back.`)
+  changed($)
+}
+
 // ---- the review -------------------------------------------------------------
 
 async function resetAll($: EngineInterface): Promise<void> {
@@ -607,7 +819,13 @@ async function resetAll($: EngineInterface): Promise<void> {
   await update($, bodiesAtom, () => ({}))
   await update($, filesAtom, () => ({}))
   await update($, taskAtom, () => ({}))
+  await update($, okAtom, () => ({}))
+  await update($, explainAtom, () => ({}))
+  await update($, versionsAtom, () => [])
+  await update($, compareAtom, () => null)
+  await update($, viewingAtom, () => null)
   await update($, uiAtom, freshUi)
+  versionCache.clear()
   await clearStore($)
   notice = undefined
   changed($)
@@ -618,7 +836,7 @@ async function isoNow($: EngineInterface): Promise<string> {
 }
 
 async function findLatestPlanFile($: EngineInterface): Promise<string | undefined> {
-  const home = await $.env.get('HOME')
+  const home = await homeDir($)
   if (!home) return undefined
   const dir = `${home}/.claude/plans`
   if (!(await $.fs.exists(dir))) return undefined
@@ -652,26 +870,27 @@ function applyTask(plan: PlanModel, task: TaskCapture): void {
 }
 
 async function writeRecord($: EngineInterface): Promise<void> {
-  const [plan, review, comments, diagram, qa] = await Promise.all([
+  const [plan, review, comments, diagram, qa, ok, versions] = await Promise.all([
     read($, planAtom),
     read($, reviewAtom),
     read($, commentsAtom),
     read($, diagramAtom),
     read($, qaAtom),
+    read($, okAtom),
+    read($, versionsAtom),
   ])
   if (!plan || review.isDemo || !review.recordPath) return
   try {
-    const text = renderRecord({ plan, review, comments, diagram, qa, nowMs: await $.clock.now() })
+    const text = renderRecord({ plan, review, comments, diagram, qa, ok, versions, nowMs: await $.clock.now() })
     await $.fs.write(review.recordPath, text)
   } catch (error) {
     $.ui.log(`plan-crutches: could not write ${review.recordPath}: ${String(error)}`, { to: 'debug' })
   }
 }
 
-async function buildPlan(
-  $: EngineInterface,
-  markdown: string,
-): Promise<{ plan: PlanModel; parsedFrom: ParsedFrom; warnings: string[] }> {
+type BuiltPlan = { plan: PlanModel; parsedFrom: ParsedFrom; warnings: string[] }
+
+async function buildPlan($: EngineInterface, markdown: string): Promise<BuiltPlan> {
   const parsed = parsePlan(markdown)
   if (parsed.ok) return { plan: parsed.plan, parsedFrom: 'block', warnings: parsed.warnings }
   const warnings = [`${parsed.reason}; structure extracted by ${options.model}`, ...parsed.warnings]
@@ -708,25 +927,47 @@ async function openPane($: EngineInterface, focus: boolean): Promise<void> {
   }
 }
 
-async function receivePlan($: EngineInterface, markdown: string, planFilePath: string | undefined, isDemo: boolean): Promise<number> {
+/** A plan coming in: from plan mode or a file (received), or an earlier version brought back (restored). */
+type Incoming = {
+  markdown: string
+  planFilePath?: string
+  isDemo: boolean
+  /** The plan already read from the markdown, when a saved version holds it. */
+  prebuilt?: BuiltPlan
+  source?: VersionSource
+  from?: number
+}
+
+async function receivePlan($: EngineInterface, incoming: Incoming): Promise<number> {
+  const { markdown, planFilePath, isDemo } = incoming
   const review = await read($, reviewAtom)
   const previous = await read($, planAtom)
   const isRevision = !isDemo && (review.status === 'revising' || review.status === 'reviewing') && previous !== null
-  const built = await buildPlan($, markdown)
+  const built = incoming.prebuilt ?? (await buildPlan($, markdown))
   const plan = built.plan
-  if (!isDemo) applyTask(plan, await read($, taskAtom))
+  if (!isDemo && !incoming.prebuilt) applyTask(plan, await read($, taskAtom))
   const version = isRevision ? review.version + 1 : 1
   const now = await isoNow($)
+  const source: VersionSource = incoming.source ?? 'received'
 
   if (isRevision) {
     await update($, commentsAtom, list =>
       list.map(one => (one.sentInVersion !== undefined && one.resolvedInVersion === undefined ? { ...one, resolvedInVersion: version } : one)),
     )
+    // An OK stays only on a file the new version plans the same way.
+    await update($, okAtom, marks => keepOkMarks(marks, previous, plan))
+    await update($, compareAtom, () => (previous ? { version: review.version, plan: previous } : null))
   } else {
     await update($, commentsAtom, () => [])
     await update($, diagramAtom, () => EMPTY_DIAGRAM)
     await update($, qaAtom, () => [])
+    await update($, okAtom, () => ({}))
+    await update($, versionsAtom, () => [])
+    await update($, compareAtom, () => null)
+    versionCache.clear()
   }
+  await update($, explainAtom, () => ({}))
+  await update($, viewingAtom, () => null)
   await update($, planAtom, () => plan)
   await update($, bodiesAtom, () => ({}))
   await update($, filesAtom, () => ({}))
@@ -734,15 +975,27 @@ async function receivePlan($: EngineInterface, markdown: string, planFilePath: s
 
   let recordPath: string | undefined
   if (!isDemo) {
-    recordPath = isRevision && review.recordPath ? review.recordPath : `${await $.session.cwd()}/${options.plansDir}/${recordFileName(await $.clock.now(), plan)}`
+    if (isRevision && review.recordPath) {
+      recordPath = review.recordPath
+    } else {
+      const [cwd, home] = await Promise.all([sessionCwd($), homeDir($)])
+      recordPath = `${recordsDir(options.plansDir, cwd, home)}/${recordFileName(await $.clock.now(), plan)}`
+    }
   }
+  const entry = await saveVersion(
+    $,
+    buildSavedVersion({ version, receivedAt: now, markdown, plan, parsedFrom: built.parsedFrom, warnings: built.warnings, source, ...(incoming.from !== undefined ? { from: incoming.from } : {}) }),
+    isDemo,
+  )
+  await update($, versionsAtom, list => [...list.filter(one => one.version !== version), entry])
+  const line = source === 'restored' ? `v${version} restored from v${incoming.from ?? '?'} ${now}` : `v${version} received ${now}`
   await update($, reviewAtom, current => ({
     status: 'reviewing' as const,
     version,
     parsedFrom: built.parsedFrom,
     warnings: built.warnings,
     previousPaths: previous?.files.map(file => file.path) ?? [],
-    history: [...(isRevision ? current.history : []), `v${version} received ${now}`],
+    history: [...(isRevision ? current.history : []), line],
     ...(planFilePath ? { planFilePath } : {}),
     ...(recordPath ? { recordPath } : {}),
     ...(isRevision && current.diagramSvgPath ? { diagramSvgPath: current.diagramSvgPath } : {}),
@@ -763,7 +1016,7 @@ async function openPlanFile($: EngineInterface, given: string): Promise<string> 
   let planFilePath: string
   let note = ''
   if (given) {
-    planFilePath = resolvePlanPath(given, await sessionCwd($), (await $.env.get('HOME')) ?? '')
+    planFilePath = resolvePlanPath(given, await sessionCwd($), await homeDir($))
     const exists = await $.fs.exists(planFilePath).catch(() => false)
     if (!exists) return `Plan Crutches: no file at ${planFilePath}.`
   } else {
@@ -782,17 +1035,18 @@ async function openPlanFile($: EngineInterface, given: string): Promise<string> 
   const review = await read($, reviewAtom)
   const sameFile = !review.isDemo && isRestorable(review) && review.planFilePath === planFilePath
   if (!sameFile) await resetAll($)
-  const version = await receivePlan($, markdown, planFilePath, false)
+  const version = await receivePlan($, { markdown, planFilePath, isDemo: false })
   const url = await openWeb($, true)
   await openPane($, true)
   return `Plan Crutches: plan v${version} opened from ${planFilePath}${note}.${url ? ` Page: ${url}` : ''}`
 }
 
 async function submit($: EngineInterface): Promise<void> {
-  const [plan, review, comments] = await Promise.all([read($, planAtom), read($, reviewAtom), read($, commentsAtom)])
+  const [plan, review, comments, ok] = await Promise.all([read($, planAtom), read($, reviewAtom), read($, commentsAtom), read($, okAtom)])
   if (!plan || review.status !== 'reviewing') return
   const pending = comments.filter(one => one.sentInVersion === undefined && one.resolvedInVersion === undefined)
   const now = await isoNow($)
+  const notes = { okPaths: Object.keys(ok).sort(), summaryEdited: review.summaryEditedInVersion === review.version }
   if (review.isDemo) {
     const text = pending.length ? `Demo: ${pending.length} comments would go to Claude as a revision request.` : 'Demo: the plan would be approved.'
     $.ui.toast(text)
@@ -803,7 +1057,7 @@ async function submit($: EngineInterface): Promise<void> {
   if (pending.length === 0) {
     await update($, reviewAtom, current => ({ ...current, status: 'approved' as const, history: [...current.history, `v${review.version} approved ${now}`] }))
     try {
-      await $.prompt.submit({ text: approvePrompt(review.version), asUser: true })
+      await $.prompt.submit({ text: approvePrompt(review.version, notes), asUser: true })
     } catch (error) {
       await update($, reviewAtom, current => ({ ...current, status: 'reviewing' as const }))
       $.ui.toast(`Plan Crutches: could not submit: ${String(error)}`)
@@ -823,7 +1077,7 @@ async function submit($: EngineInterface): Promise<void> {
     history: [...current.history, `v${review.version} sent back with ${pending.length} comments ${now}`],
   }))
   try {
-    await $.prompt.submit({ text: revisionPrompt(plan, pending, review.version), asUser: true })
+    await $.prompt.submit({ text: revisionPrompt(plan, pending, review.version, notes), asUser: true })
   } catch (error) {
     await update($, commentsAtom, list => list.map(one => (sentIds.has(one.id) ? { id: one.id, target: one.target, text: one.text, createdInVersion: one.createdInVersion } : one)))
     await update($, reviewAtom, current => ({ ...current, status: 'reviewing' as const }))
@@ -950,10 +1204,11 @@ async function generateBody($: EngineInterface, file: PlanFile, symbol: PlanSymb
   }
   const related = await gatherRelatedFiles($, plan, file, symbol, fileText)
   const bodies = await read($, bodiesAtom)
+  const currentCode = symbol.change === 'modified' && fileText ? currentSymbolText(fileText, symbol.name, file.path) : null
   const reply = await $.model.complete({
     model: options.bodyModel || options.model,
     system: BODY_SYSTEM,
-    prompt: bodyPrompt({ plan, file, symbol, fileText, bodies, related }),
+    prompt: bodyPrompt({ plan, file, symbol, fileText, bodies, related, currentCode }),
     maxTokens: 6000,
     timeoutMs: 300_000,
   })
@@ -1047,6 +1302,95 @@ async function askMore($: EngineInterface, id: string, question: string): Promis
         : one,
     ),
   )
+  await writeRecord($)
+  changed($)
+}
+
+/**
+ * The popup's Explain tab: what the place the user points at is, where it
+ * sits and why the plan changes it. Asked only when the tab opens; the page
+ * names the id so it can follow the answer.
+ */
+async function explain($: EngineInterface, id: string, target: CommentTarget, focus?: string): Promise<void> {
+  const [plan, review, ui, known] = await Promise.all([read($, planAtom), read($, reviewAtom), read($, uiAtom), read($, explainAtom)])
+  if (!plan || known[id]) return
+  await update($, explainAtom, map => ({ ...map, [id]: { status: 'asking' as const, target, ...(focus ? { focus } : {}), createdInVersion: review.version } }))
+  changed($)
+  let fileText: string | null = null
+  const path = target.path && !target.path.endsWith('/') ? target.path : undefined
+  if (path && plan.files.some(file => file.path === path && file.status !== 'new')) {
+    await loadFile($, path)
+    fileText = (await read($, filesAtom))[path] ?? null
+  }
+  const { answer, failure } = await answerQuestion($, plan, explainPrompt(plan, target, focus, fileText, ui.lang))
+  await update($, explainAtom, map => {
+    const current = map[id]
+    if (!current) return map
+    return { ...map, [id]: answer !== undefined ? { ...current, status: 'done' as const, text: answer } : { ...current, status: 'failed' as const, text: failure ?? 'unknown' } }
+  })
+  changed($)
+}
+
+/** The user's OK on files: no comments wanted there. A folder path (`dir/`) covers every planned file under it. */
+async function setOk($: EngineInterface, paths: readonly string[], ok: boolean): Promise<void> {
+  const [plan, review] = await Promise.all([read($, planAtom), read($, reviewAtom)])
+  if (!plan) return
+  const now = await isoNow($)
+  const targets = new Set<string>()
+  for (const path of paths) {
+    if (path.endsWith('/')) for (const under of pathsUnderFolder(plan, path)) targets.add(under)
+    else if (plan.files.some(file => file.path === path)) targets.add(path)
+  }
+  if (targets.size === 0) return
+  await update($, okAtom, marks => {
+    const next = { ...marks }
+    for (const path of targets) {
+      if (ok) next[path] = { version: review.version, at: now }
+      else delete next[path]
+    }
+    return next
+  })
+  await writeRecord($)
+  changed($)
+}
+
+/**
+ * The summary as the user edited it on the page: into the plan state, into
+ * the plan file (so Claude's next read sees it) and into the saved version.
+ */
+async function editSummary($: EngineInterface, text: string): Promise<void> {
+  const [plan, review] = await Promise.all([read($, planAtom), read($, reviewAtom)])
+  if (!plan) return
+  if (review.status !== 'reviewing') {
+    setNotice(review.status === 'revising' ? 'Claude is revising the plan; edit the text once the new version has arrived.' : 'The plan is not under review.')
+    changed($)
+    return
+  }
+  if (text === plan.summary) return
+  const next: PlanModel = { ...plan, summary: text }
+  await update($, planAtom, () => next)
+  const now = await isoNow($)
+  let markdown: string | undefined
+  if (!review.isDemo && review.planFilePath) {
+    try {
+      markdown = applySummary(await $.fs.read(review.planFilePath), text)
+      await $.fs.write(review.planFilePath, markdown)
+    } catch (error) {
+      setNotice(`Could not write the plan file: ${String(error)}`)
+      markdown = undefined
+    }
+  }
+  const saved = await loadVersion($, review.version)
+  if (saved) {
+    const edited = buildSavedVersion({ ...saved, markdown: markdown ?? applySummary(saved.markdown, text), plan: next, source: 'edited' })
+    const entry = await saveVersion($, edited, Boolean(review.isDemo))
+    await update($, versionsAtom, list => list.map(one => (one.version === entry.version ? entry : one)))
+  }
+  await update($, reviewAtom, current => ({
+    ...current,
+    summaryEditedInVersion: review.version,
+    history: [...current.history, `v${review.version} summary edited by the user ${now}`],
+  }))
   await writeRecord($)
   changed($)
 }
@@ -1319,6 +1663,18 @@ async function handleAction($: EngineInterface, action: WebAction): Promise<void
       return ask($, action.question, action.focus, action.target, action.id)
     case 'askMore':
       return askMore($, action.id, action.question)
+    case 'explain':
+      return explain($, action.id, action.target, action.focus)
+    case 'setOk':
+      return setOk($, action.paths, action.ok)
+    case 'editSummary':
+      return editSummary($, action.text)
+    case 'viewVersion':
+      return viewVersion($, action.version)
+    case 'compareWith':
+      return compareWith($, action.version)
+    case 'restoreVersion':
+      return restoreVersion($, action.version)
     case 'generateDiagram':
       return generateDiagram($)
     case 'callers':
@@ -1348,14 +1704,14 @@ export const register: Register = (on, rawOptions) => {
     if (review.status === 'idle') {
       // A new process: the session state is empty. The same session resumed
       // takes its stored review up; another session is told it is there.
-      const stored = await readStored($)
-      if (stored && stored.sessionId === (await currentSessionId($))) {
-        if ((await restoreReview($, stored)) === 'restored') {
+      const found = await readStored($)
+      if (found && found.stored.sessionId === (await currentSessionId($))) {
+        if ((await restoreReview($, found)) === 'restored') {
           review = await read($, reviewAtom)
           $.ui.toast(`Plan Crutches: plan v${review.version} restored after the restart; /plan-review opens the page.`)
         }
-      } else if (stored) {
-        $.ui.toast(`Plan Crutches: an unfinished review of "${stored.plan.title}" (v${stored.review.version}) is stored for this folder; /plan-review restore brings it back.`)
+      } else if (found) {
+        $.ui.toast(`Plan Crutches: an unfinished review of "${found.stored.plan.title}" (v${found.stored.review.version}) is stored for this folder; /plan-review restore brings it back.`)
       }
     }
     if (review.status === 'idle') await update($, uiAtom, ui => ({ ...ui, lang: options.language }))
@@ -1400,16 +1756,16 @@ export const register: Register = (on, rawOptions) => {
     if (arg === 'restore') {
       const review = await read($, reviewAtom)
       if (review.status === 'reviewing' || review.status === 'revising') return { text: `Plan v${review.version} is already under review in this session.` }
-      const stored = await readStored($)
-      if (!stored) return { text: 'No stored review for this folder.' }
-      if ((await restoreReview($, stored)) === 'gone') return { text: `The stored review cannot come back: its plan file is gone (${stored.review.planFilePath ?? 'no path'}).` }
+      const found = await readStored($)
+      if (!found) return { text: 'No stored review for this folder.' }
+      if ((await restoreReview($, found)) === 'gone') return { text: `The stored review cannot come back: its plan file is gone (${found.stored.review.planFilePath ?? 'no path'}).` }
       const url = await openWeb($, true)
       await openPane($, true)
-      return { text: `Plan Crutches: plan v${stored.review.version} restored.${url ? ` Page: ${url}` : ''}` }
+      return { text: `Plan Crutches: plan v${found.stored.review.version} restored.${url ? ` Page: ${url}` : ''}` }
     }
     if (arg === 'demo') {
       await resetAll($)
-      const version = await receivePlan($, DEMO_PLAN, undefined, true)
+      const version = await receivePlan($, { markdown: DEMO_PLAN, isDemo: true })
       const url = await openWeb($, true)
       await openPane($, true)
       return { text: `Plan Crutches demo plan opened (version ${version}).${url ? ` Page: ${url}` : ''}` }
@@ -1496,7 +1852,7 @@ export const register: Register = (on, rawOptions) => {
       return next(e)
     }
     const markdown = await $.fs.read(planFilePath)
-    const version = await receivePlan($, markdown, planFilePath, false)
+    const version = await receivePlan($, { markdown, planFilePath, isDemo: false })
     const url = await openWeb($, version === 1)
     await openPane($, true)
     $.ui.toast(`Plan Crutches: plan v${version} is ready for review${url ? ` at ${url}` : ''}.`)

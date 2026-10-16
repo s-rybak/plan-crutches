@@ -14,9 +14,10 @@ export const BLOCK_SCHEMA = `\`\`\`plan-crutches
         {
           "name": "functionName",
           "kind": "function" | "method" | "class" | "type" | "const" | "other",
+          "change": "new" | "modified" | "deleted",
           "signature": "the full signature, no body (several lines allowed)",
           "description": "What it does, one or two sentences.",
-          "anchor": "where it goes: after existingName | before existingName | top of file | end of file"
+          "anchor": "for a new symbol, where it goes: after existingName | before existingName | top of file | end of file"
         }
       ]
     }
@@ -32,6 +33,7 @@ ${BLOCK_SCHEMA}
 
 Rules for the block:
 - List every file the plan creates, changes or deletes. A deleted file has an empty symbols list.
+- List every symbol the plan touches in a modified file, with "change": "new" for one that does not exist yet, "modified" for an existing one whose signature or body changes, "deleted" for an existing one that goes away. Use the exact name the file declares today for modified and deleted symbols. A deleted symbol needs only name, kind and a short description.
 - Give signatures only, never implementations. Methods of a changed class are separate symbols with kind "method".
 - Put the task text in "task.text" verbatim: the Jira issue text when you fetched one (source "jira", with its key), else the user's request (source "user").
 - Keep the Markdown plan above the block as you normally write it.
@@ -43,7 +45,7 @@ Review protocol:
 </plan-crutches>`
 
 export const PLAN_BLOCK_REMINDER =
-  'Plan Crutches: end the plan file with the ```plan-crutches JSON block (title, summary, task, files with status and symbol signatures). Wait after ExitPlanMode reports the plan is under review.'
+  'Plan Crutches: end the plan file with the ```plan-crutches JSON block (title, summary, task, files with status and symbols with change new/modified/deleted and signatures). Wait after ExitPlanMode reports the plan is under review.'
 
 export function denyMessage(version: number): string {
   return (
@@ -60,7 +62,7 @@ export function extractionPrompt(markdown: string): string {
   return (
     'Read the plan below and produce JSON of exactly this shape:\n\n' +
     BLOCK_SCHEMA.replace(/```plan-crutches\n|\n```$/g, '') +
-    '\n\nRules: list every file the plan creates, changes or deletes with its status; give signatures only, never bodies; ' +
+    '\n\nRules: list every file the plan creates, changes or deletes with its status; list every symbol the plan touches with its change (new, modified or deleted); give signatures only, never bodies; ' +
     'copy the task text verbatim when the plan states it, else leave task.text empty with source "none"; keep summary to the essentials.\n\n' +
     '<plan>\n' +
     markdown.slice(0, 60000) +
@@ -81,6 +83,7 @@ export const BODY_LIMITS = {
   surface: 30000,
   bodies: 40000,
   currentFile: 24000,
+  currentSymbol: 12000,
   relatedFile: 10000,
   relatedTotal: 60000,
   fileList: 3500,
@@ -88,6 +91,10 @@ export const BODY_LIMITS = {
 
 function cut(text: string, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit)}\n… (cut, ${text.length - limit} more characters)` : text
+}
+
+function changeTag(symbol: PlanSymbol): string {
+  return symbol.change && symbol.change !== 'new' ? `, ${symbol.change}` : ''
 }
 
 /**
@@ -100,7 +107,7 @@ export function planSurface(plan: PlanModel, limit = BODY_LIMITS.surface): strin
   for (const file of plan.files) {
     lines.push(`- ${file.path} (${file.status})${file.description ? `: ${file.description}` : ''}`)
     for (const symbol of file.symbols) {
-      lines.push(`  - [${symbol.kind}] ${symbol.name}${symbol.anchor ? ` (${symbol.anchor})` : ''}`)
+      lines.push(`  - [${symbol.kind}${changeTag(symbol)}] ${symbol.name}${symbol.anchor ? ` (${symbol.anchor})` : ''}`)
       for (const part of symbol.signature.split('\n')) lines.push(`      ${part}`)
       if (symbol.description) lines.push(`      ${symbol.description}`)
     }
@@ -155,6 +162,8 @@ export type BodyContext = {
   fileText: string | null
   bodies: Record<string, GeneratedBody>
   related: readonly RelatedFile[]
+  /** For a modified symbol: its code as the file holds it today. */
+  currentCode?: string | null
 }
 
 /**
@@ -166,7 +175,7 @@ export function bodyPrompt(context: BodyContext): { text: string; cache?: true }
   const { plan, file, symbol, fileText, bodies, related } = context
   const own = file.symbols
     .filter(one => one.name !== symbol.name)
-    .map(one => `- ${one.signature.split('\n')[0]}`)
+    .map(one => `- ${one.signature.split('\n')[0]}${one.change && one.change !== 'new' ? ` (${one.change})` : ''}`)
     .join('\n')
   const parts = [
     `File: ${file.path} (${file.status})`,
@@ -178,7 +187,15 @@ export function bodyPrompt(context: BodyContext): { text: string; cache?: true }
   const relatedText = relatedFilesText(related)
   if (relatedText) parts.push(relatedText)
   if (fileText) parts.push(`Current content of ${file.path}:\n\`\`\`\n${cut(fileText, BODY_LIMITS.currentFile)}\n\`\`\``)
-  parts.push(`Implement this symbol:\nSignature:\n${symbol.signature}\nWhat it does: ${symbol.description}`)
+  if (symbol.change === 'modified') {
+    const current = context.currentCode ? `Its code today, which your implementation replaces:\n\`\`\`\n${cut(context.currentCode, BODY_LIMITS.currentSymbol)}\n\`\`\`\n` : ''
+    parts.push(
+      `Modify this existing symbol: write its whole new implementation, keep the behavior the plan does not change, and keep the planned signature.\n${current}` +
+        `Signature:\n${symbol.signature}\nWhat changes: ${symbol.description}`,
+    )
+  } else {
+    parts.push(`Implement this symbol:\nSignature:\n${symbol.signature}\nWhat it does: ${symbol.description}`)
+  }
   return [{ text: `${planSurface(plan)}\n\n`, cache: true }, { text: parts.join('\n\n') }]
 }
 
@@ -273,7 +290,19 @@ function commentLine(comment: ReviewComment): string {
   return `  - ${prefix}${comment.text}`
 }
 
-export function revisionPrompt(plan: PlanModel, comments: readonly ReviewComment[], version: number): string {
+/** What the review adds to a revision or approval prompt beyond the comments. */
+export type ReviewNotes = {
+  /** The files the user marked OK: reviewed, no change wanted. */
+  okPaths?: readonly string[]
+  /** Whether the user edited the summary text in the plan file in this version. */
+  summaryEdited?: boolean
+}
+
+function summaryEditedNote(): string {
+  return 'The user edited the plan text (the summary) directly in the plan file. The file already holds that edit: keep the user\'s wording and build on it.'
+}
+
+export function revisionPrompt(plan: PlanModel, comments: readonly ReviewComment[], version: number, notes: ReviewNotes = {}): string {
   const planLevel = comments.filter(one => !one.target.path)
   const byPath = new Map<string, ReviewComment[]>()
   for (const comment of comments) {
@@ -285,6 +314,7 @@ export function revisionPrompt(plan: PlanModel, comments: readonly ReviewComment
   const sections: string[] = [
     `Plan review (Plan Crutches), plan version ${version} of "${plan.title}". Revise the plan per the comments below, update the plan file (the Markdown and the plan-crutches block), then call ExitPlanMode again.`,
   ]
+  if (notes.summaryEdited) sections.push(summaryEditedNote())
   if (planLevel.length) {
     sections.push('Comments on the whole plan:\n' + planLevel.map(one => `- ${one.text}`).join('\n'))
   }
@@ -298,11 +328,16 @@ export function revisionPrompt(plan: PlanModel, comments: readonly ReviewComment
     }
     sections.push('Comments by file:\n' + blocks.join('\n'))
   }
+  if (notes.okPaths && notes.okPaths.length) {
+    sections.push('Files the user marked as reviewed OK (no change wanted there; change them only when a comment above requires it):\n' + notes.okPaths.map(path => `- ${path}`).join('\n'))
+  }
   return sections.join('\n\n')
 }
 
-export function approvePrompt(version: number): string {
-  return `Plan review (Plan Crutches): the user approved plan version ${version} without comments. Call ExitPlanMode now to proceed to implementation.`
+export function approvePrompt(version: number, notes: ReviewNotes = {}): string {
+  const base = `Plan review (Plan Crutches): the user approved plan version ${version} without comments.`
+  if (notes.summaryEdited) return `${base} ${summaryEditedNote()} Read the plan file again, then call ExitPlanMode to proceed to implementation.`
+  return `${base} Call ExitPlanMode now to proceed to implementation.`
 }
 
 /** Where a question's selection came from, for the prompts and the record. */
@@ -355,6 +390,31 @@ export function askMorePrompt(plan: PlanModel, item: QaItem, question: string): 
     selectionContext(item.target) +
     `Conversation so far:\n${turns.join('\n\n')}\n\nUser: ${question}`
   )
+}
+
+/**
+ * The prompt of the popup's Explain tab: what the place the user points at
+ * is, where it sits in the project and why the plan makes the change.
+ * `fileText` is the current file when the mod has it, for the "where".
+ */
+export function explainPrompt(plan: PlanModel, target: CommentTarget, focus?: string, fileText?: string | null, lang: 'en' | 'uk' = 'en'): string {
+  const where = describeQaTarget(target) || focus || 'the whole plan'
+  const file = target.path ? plan.files.find(one => one.path === target.path) : undefined
+  const symbol = file && target.symbol ? file.symbols.find(one => one.name === target.symbol) : undefined
+  const parts = [
+    `Plan Crutches: explain one place of the plan "${plan.title}" currently under review to its reviewer. ` +
+      `Answer in ${lang === 'uk' ? 'Ukrainian' : 'English'}, in Markdown, under 250 words, with three short sections titled What, Where and Why: ` +
+      'what this change is, where it sits in the project (the file, the symbol and what calls it or depends on it, as far as the plan and the code you know tell), and why the plan makes it (the task it serves and what would break without it). ' +
+      'Do not change the plan and do not call tools.',
+    planSurface(plan, ASK_SURFACE_LIMIT),
+    `The place to explain: ${where}.`,
+  ]
+  if (file) parts.push(`Planned change of ${file.path} (${file.status}): ${file.description}`)
+  if (symbol) parts.push(`Planned symbol ${symbol.name} [${symbol.kind}${changeTag(symbol)}]:\n${symbol.signature}\n${symbol.description}`)
+  if (fileText) parts.push(`Current content of ${target.path}:\n\`\`\`\n${cut(fileText, 8000)}\n\`\`\``)
+  const selection = selectionContext(target)
+  if (selection) parts.push(selection.trimEnd())
+  return parts.join('\n\n')
 }
 
 /** A question thread as text, for a comment or the Markdown record. */

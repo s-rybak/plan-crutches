@@ -1,5 +1,7 @@
 export type FileStatus = 'new' | 'modified' | 'deleted'
 export type SymbolKind = 'function' | 'method' | 'class' | 'type' | 'const' | 'other'
+/** What the plan does to a symbol: adds it, changes one that exists, or removes one. */
+export type SymbolChange = 'new' | 'modified' | 'deleted'
 
 export type PlanSymbol = {
   name: string
@@ -7,6 +9,8 @@ export type PlanSymbol = {
   signature: string
   description: string
   anchor?: string
+  /** Absent means `new`. A modified or deleted symbol exists in the file today. */
+  change?: SymbolChange
 }
 
 export type PlanFile = {
@@ -44,6 +48,8 @@ export type Review = {
   previousPaths: string[]
   diagramSvgPath?: string
   isDemo?: boolean
+  /** The version in which the user last edited the summary text; the plan file holds the edit. */
+  summaryEditedInVersion?: number
 }
 
 export type ReviewComment = {
@@ -117,6 +123,52 @@ export type QaItem = {
   createdInVersion?: number
 }
 
+/**
+ * An explanation of one place of the plan, asked from the popup's Explain
+ * tab: what the change is, where it sits and why the plan makes it.
+ */
+export type Explanation = {
+  status: QaStatus
+  text?: string
+  target: CommentTarget
+  focus?: string
+  createdInVersion: number
+}
+
+/** The user's OK on a file: no comments wanted; `version` is the plan version it was given for. */
+export type OkMark = { version: number; at: string }
+
+/** How a plan version came to be. */
+export type VersionSource = 'received' | 'restored' | 'edited'
+
+/** One saved plan version, as the state lists it; the plan and its markdown sit in the file at `path`. */
+export type PlanVersion = {
+  version: number
+  receivedAt: string
+  title: string
+  fileCount: number
+  source: VersionSource
+  /** For a restored version: the version it brought back. */
+  from?: number
+  /** The JSON file that holds this version, empty for the demo. */
+  path: string
+}
+
+/** The content of one saved version: the plan file as it was and the plan read from it. */
+export type SavedVersion = {
+  version: number
+  receivedAt: string
+  markdown: string
+  plan: PlanModel
+  parsedFrom: ParsedFrom
+  warnings: string[]
+  source: VersionSource
+  from?: number
+}
+
+/** An earlier version loaded for the page: to look at, or to compare the current plan with. */
+export type LoadedVersion = { version: number; plan: PlanModel }
+
 export type DiagramStatus = 'idle' | 'loading' | 'ready' | 'failed'
 export type DiagramFileStatus = FileStatus | 'unchanged'
 
@@ -164,9 +216,11 @@ export type Diagram = {
 export type FileCache = Record<string, string | null>
 
 /**
- * A live review as the plugin store keeps it, keyed by the project folder, so
- * a later process in the same folder can take it up again. `shape` names the
- * layout of this record; a record of another shape is ignored.
+ * A live review as the mod keeps it between processes: a JSON file under
+ * the mod's folder in the user's Claude configuration directory, keyed by
+ * the project folder, so a later process in the same folder can take it up
+ * again. `shape` names the layout of this record; a record of another shape
+ * is ignored. The generated bodies sit in a file of their own beside it.
  */
 export type StoredReview = {
   shape: number
@@ -181,14 +235,17 @@ export type StoredReview = {
   diagram: Diagram
   task: TaskCapture
   ui: UiState
-  /** The generated bodies, kept only while the whole record stays small. */
+  ok: Record<string, OkMark>
+  versions: PlanVersion[]
+  explanations?: Record<string, Explanation>
+  /** The generated bodies, when they ride inside the record (a test, or an old record). */
   bodies?: Record<string, GeneratedBody>
   /** The page token, so the token the page kept stays valid after a restart. */
   token?: string
 }
 
-/** One row of the store's index: a folder with a stored review, newest first. */
-export type StoredIndexEntry = { cwd: string; savedAt: string; title: string; version: number }
+/** One row of the store's index: a folder with a stored review, newest first; `dir` holds the review's files. */
+export type StoredIndexEntry = { cwd: string; savedAt: string; title: string; version: number; dir?: string }
 
 /** The review page server as the mod knows it; the token outlives restarts. */
 export type WebState = {
@@ -209,6 +266,9 @@ export type WebFileEntry = {
 
 export type WebNotice = { id: number; text: string }
 
+/** An earlier version as the page shows it: its plan and the file views built for it. */
+export type WebViewing = { version: number; plan: PlanModel; files: Record<string, WebFileEntry> }
+
 /** Everything the page draws, pushed whole after each change. */
 export type WebSnapshot = {
   plan: PlanModel | null
@@ -218,6 +278,13 @@ export type WebSnapshot = {
   qa: QaItem[]
   diagram: Diagram
   files: Record<string, WebFileEntry>
+  ok: Record<string, OkMark>
+  explanations: Record<string, Explanation>
+  versions: PlanVersion[]
+  /** The version the current plan is compared with when the page highlights changes. */
+  compare?: LoadedVersion
+  /** An earlier version the user opened to look at. */
+  viewing?: WebViewing
   lang: Lang
   summaryLimit: number
   cwd: string
@@ -241,6 +308,11 @@ declare module 'claude-code' {
       diagram: Diagram
       files: FileCache
       web: WebState
+      ok: Record<string, OkMark>
+      explanations: Record<string, Explanation>
+      versions: PlanVersion[]
+      compare: LoadedVersion | null
+      viewing: LoadedVersion | null
     }
   }
 }

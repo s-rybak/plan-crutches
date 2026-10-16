@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { DEMO_PLAN } from '../hooks/demo-plan'
-import { insertionIndex, newFileStub, stubDiff } from '../hooks/diff'
-import { findBlock, parsePlan, planFromMarkdown, stripBlocks } from '../hooks/plan-parser'
+import { currentSymbolText, declarationScore, insertionIndex, newFileStub, stubDiff, symbolRange, unifiedDiff } from '../hooks/diff'
+import { applySummary, findBlock, normalizeChange, parsePlan, planFromMarkdown, stripBlocks } from '../hooks/plan-parser'
 import { revisionPrompt } from '../hooks/prompts'
 import { renderRecord } from '../hooks/record'
 import { allDirKeys, buildTree, visibleRows } from '../hooks/tree'
@@ -39,6 +39,42 @@ describe('plan parser', () => {
     expect(parsed.plan.files[0]?.path).toBe('a/b.ts')
     expect(parsed.plan.files[0]?.status).toBe('new')
     expect(parsed.plan.files[0]?.symbols[0]?.name).toBe('go')
+  })
+
+  test('reads what the plan does to each symbol: new by default, modified or deleted when said or implied', async () => {
+    const parsed = parsePlan(DEMO_PLAN)
+    if (!parsed.ok) throw new Error(parsed.reason)
+    const user = parsed.plan.files.find(file => file.path === 'src/auth/user.ts')
+    expect(user?.symbols.map(symbol => [symbol.name, symbol.change])).toEqual([
+      ['getCurrentUser', 'modified'],
+      ['displayNameOf', 'deleted'],
+    ])
+    const session = parsed.plan.files.find(file => file.path === 'src/auth/session.ts')
+    expect(session?.symbols.every(symbol => symbol.change === undefined)).toBe(true)
+    expect(normalizeChange({ change: 'Modified' }, 'modified')).toBe('modified')
+    expect(normalizeChange({ status: 'removed' }, 'modified')).toBe('deleted')
+    expect(normalizeChange({ op: 'add' }, 'modified')).toBe('new')
+    expect(normalizeChange({ anchor: 'replaces loadUser' }, 'modified')).toBe('modified')
+    expect(normalizeChange({ anchor: 'remove it' }, 'modified')).toBe('deleted')
+    expect(normalizeChange({ anchor: 'after loadUser' }, 'modified')).toBe('new')
+    expect(normalizeChange({ change: 'deleted' }, 'new')).toBe('new')
+  })
+
+  test('puts an edited summary into the block, or above it, or in place of the whole file', async () => {
+    const edited = applySummary(DEMO_PLAN, 'A new summary.\n\nWith two lines.')
+    const parsed = parsePlan(edited)
+    expect(parsed.ok).toBe(true)
+    if (!parsed.ok) return
+    expect(parsed.plan.summary).toBe('A new summary.\n\nWith two lines.')
+    expect(parsed.plan.files.length).toBe(5)
+    expect(parsed.plan.task.key).toBe('AUTH-42')
+    expect(edited.startsWith('# Session refresh for the auth module')).toBe(true)
+    const noSummary = ['# T', '', 'Old prose.', '', '```plan-crutches', '{ "files": [] }', '```'].join('\n')
+    const above = applySummary(noSummary, '# T\n\nNew prose.')
+    expect(above).toBe(['# T', '', 'New prose.', '', '```plan-crutches', '{ "files": [] }', '```'].join('\n'))
+    const aboveParsed = parsePlan(above)
+    expect(aboveParsed.ok && aboveParsed.plan.summary).toBe('# T\n\nNew prose.')
+    expect(applySummary('Just prose.', 'Other prose.')).toBe('Other prose.\n')
   })
 
   test('reports a plan without a block and falls back to markdown', async () => {
@@ -101,6 +137,74 @@ describe('stub diff', () => {
     const preview = newFileStub({ ...file, status: 'new', path: 'src/new.py' })
     expect(preview).toContain('# Refresh before returning the user.')
     expect(preview).toContain('export async function getCurrentUser')
+  })
+
+  const existing = [
+    "import { db } from './db'",
+    '',
+    '/** Loads one user. */',
+    'export async function loadUser(id: string): Promise<User | null> {',
+    '  const row = await db.get(id)',
+    '  if (!row) return null',
+    '  return row as User',
+    '}',
+    '',
+    'export const KEY = `k-${1}`',
+    '',
+    'export class Store {',
+    '  private items = new Map<string, User>()',
+    '',
+    '  get(id: string): User | undefined {',
+    '    return this.items.get(id)',
+    '  }',
+    '',
+    '  clear(): void {',
+    '    this.items.clear()',
+    '  }',
+    '}',
+  ]
+
+  test('finds the code a symbol has today: keyword forms, methods, one-line consts, Python blocks', async () => {
+    expect(symbolRange(existing, 'loadUser', 'a.ts')).toEqual({ start: 2, end: 8 })
+    expect(symbolRange(existing, 'KEY', 'a.ts')).toEqual({ start: 9, end: 10 })
+    expect(symbolRange(existing, 'Store', 'a.ts')).toEqual({ start: 11, end: 22 })
+    expect(symbolRange(existing, 'Store.clear', 'a.ts')).toEqual({ start: 18, end: 21 })
+    expect(symbolRange(existing, 'get', 'a.ts')).toEqual({ start: 14, end: 17 })
+    expect(symbolRange(existing, 'nothing', 'a.ts')).toBe(null)
+    expect(declarationScore('  return loadUser(id)', 'loadUser')).toBe(0)
+    expect(declarationScore('export function loadUser() {', 'loadUser')).toBe(3)
+    expect(declarationScore('  loadUser(): void {', 'loadUser')).toBe(2)
+    const python = ['import os', '', '@cache', 'def load(path):', '    with open(path) as f:', '        return f.read()', '', 'def other():', '    pass']
+    expect(symbolRange(python, 'load', 'x.py')).toEqual({ start: 2, end: 6 })
+    expect(currentSymbolText(python.join('\n'), 'other', 'x.py')).toBe('def other():\n    pass')
+    expect(currentSymbolText(existing.join('\n'), 'KEY', 'a.ts')).toBe('export const KEY = `k-${1}`')
+  })
+
+  test('a modified symbol replaces its code and a deleted one removes it, as - and + lines', async () => {
+    const changed = {
+      path: 'src/store.ts',
+      status: 'modified' as const,
+      description: 'Rework the loader, drop the key.',
+      symbols: [
+        { name: 'loadUser', kind: 'function' as const, change: 'modified' as const, signature: 'export async function loadUser(id: string, fresh = false): Promise<User | null> {', description: 'Loads a user, bypassing the cache when fresh.' },
+        { name: 'KEY', kind: 'const' as const, change: 'deleted' as const, signature: 'export const KEY', description: 'No longer used.' },
+        { name: 'gone', kind: 'function' as const, change: 'deleted' as const, signature: 'function gone()', description: 'Not in the file.' },
+        { name: 'added', kind: 'function' as const, signature: 'export function added(): void {', description: 'New.', anchor: 'end of file' },
+      ],
+    }
+    const diff = stubDiff(existing.join('\n'), changed)
+    const lines = diff.split('\n')
+    expect(lines[0]).toBe('@@ -1,12 +1,9 @@')
+    expect(lines.filter(line => line.startsWith('@@')).length).toBe(2)
+    expect(diff).toContain('-/** Loads one user. */\n-export async function loadUser(id: string): Promise<User | null> {\n-  const row = await db.get(id)\n-  if (!row) return null\n-  return row as User\n-}\n')
+    expect(diff).toContain('+// Loads a user, bypassing the cache when fresh.\n+export async function loadUser(id: string, fresh = false): Promise<User | null> {\n+  // implementation: expand in Plan Crutches\n+}')
+    expect(diff).toContain('-export const KEY = `k-${1}`')
+    expect(diff).not.toContain('+export const KEY')
+    expect(diff).toContain('+// delete gone: not found in the current file')
+    expect(diff).toContain('+export function added(): void {')
+    expect(diff.indexOf('-export const KEY')).toBeGreaterThan(diff.indexOf('+export async function loadUser'))
+    const only = unifiedDiff(['a', 'b', 'c', 'd', 'e', 'f'], [{ start: 1, end: 2, lines: ['B'] }, { start: 5, end: 6, lines: [] }], 1)
+    expect(only).toBe(['@@ -1,3 +1,3 @@', ' a', '-b', '+B', ' c', '@@ -5,2 +5,1 @@', ' e', '-f'].join('\n'))
   })
 })
 

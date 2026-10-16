@@ -1,7 +1,7 @@
 {
   "name": "plan-crutches",
-  "version": "0.2.0",
-  "description": "Visual review of Claude's plan before it runs: a browser page with the change tree, signatures, comments, a diagram editor and Q&A.",
+  "version": "0.3.0",
+  "description": "Visual review of Claude's plan before it runs: a browser page with the change tree, OK marks per file, signatures and +/- diffs of the changed methods, comments, an Explain tab, plan versions with compare and restore, a 3D diagram and Q&A.",
   "types": "./types/index.d.ts",
   "userConfig": {
     "language": {
@@ -28,9 +28,9 @@
     },
     "plansDir": {
       "type": "string",
-      "title": "Plans folder",
-      "description": "Folder, relative to the project, where each reviewed plan is recorded as a Markdown file",
-      "default": "docs/plans"
+      "title": "Review files folder",
+      "description": "Where the Markdown records and SVG files go. Empty, an absolute path or a path under ~ means a shared folder with one subfolder per project. Any other path is a folder inside the project. The live review and the saved plan versions always sit under ~/.claude/plan-crutches/<project>.",
+      "default": "~/.claude/plan-crutches"
     },
     "summaryLimit": {
       "type": "number",

@@ -359,3 +359,64 @@ main { padding: 12px 16px 60px; }
 .spinner.big { width: 28px; height: 28px; border-width: 3px; }
 
 kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-code); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
+
+/* OK marks: reviewed, no comments wanted */
+.okbox {
+  flex: none; width: 16px; height: 16px; padding: 0; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg); color: var(--new); font-size: 11px; line-height: 14px; text-align: center; cursor: pointer;
+}
+.okbox.none { border-color: transparent; background: transparent; cursor: default; }
+.okbox:not(.none):hover { border-color: var(--new); background: var(--new-soft); }
+.okbox.on { background: var(--new-soft); border-color: var(--new); }
+.okbox.part { color: var(--fg-dim); border-color: var(--fg-dim); }
+.row.ok .name { opacity: 0.65; }
+.row.ghost { opacity: 0.55; cursor: default; }
+.row.ghost .name { text-decoration: line-through; }
+.row.ghost:hover { background: transparent; }
+.chip.okcount { background: var(--bg-code); color: var(--fg-dim); text-transform: none; }
+.chip.okcount.done { background: var(--new-soft); color: var(--new); }
+.badge.ok { background: var(--bg-code); }
+.badge.ok.done { background: var(--new-soft); color: var(--new); }
+.ghost-note { padding: 6px 6px 2px; }
+
+/* what changed since another version */
+.chip.delta { text-transform: none; }
+.chip.delta.added { background: var(--new-soft); color: var(--new); }
+.chip.delta.changed { background: var(--comment-soft); color: var(--comment); }
+.chip.delta.removed { background: var(--del-soft); color: var(--del); }
+.chip.change { text-transform: none; }
+.chip.change.modified { background: var(--mod-soft); color: var(--mod); }
+.chip.change.deleted { background: var(--del-soft); color: var(--del); }
+.symbol.change-deleted { border-color: var(--del-soft); }
+.symbol.ghost { opacity: 0.6; border-style: dashed; }
+.symbol .was-desc del { color: var(--fg-dim); }
+.hint.edited { color: var(--comment); text-transform: none; letter-spacing: 0; }
+.compare { display: inline-flex; gap: 6px; align-items: center; text-transform: none; letter-spacing: 0; font-weight: 400; }
+.select { font: inherit; color: inherit; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 4px 8px; }
+.select.small { padding: 2px 6px; font-size: 12px; }
+.textdiff { white-space: pre-wrap; word-break: break-word; font-size: 13.5px; line-height: 1.6; }
+.textdiff ins, .textdiff-legend ins { background: var(--diff-add-bg); color: var(--diff-add-fg); text-decoration: none; border-radius: 3px; padding: 0 2px; }
+.textdiff del, .textdiff-legend del { background: var(--diff-del-bg); color: var(--diff-del-fg); text-decoration: line-through; border-radius: 3px; padding: 0 2px; }
+.textdiff-legend { display: flex; gap: 10px; align-items: center; font-size: 11.5px; color: var(--fg-dim); margin-bottom: 8px; }
+
+/* the summary editor */
+.summary-edit {
+  width: 100%; min-height: 160px; resize: vertical; font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+  color: inherit; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px;
+}
+.summary-edit:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.edit-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.edit-actions .spacer { flex: 1; }
+
+/* an earlier version on screen */
+.banner.viewing { border-color: var(--accent); background: var(--accent-soft); flex-wrap: wrap; }
+.banner .spacer { flex: 1; }
+.versions { list-style: none; padding: 0; margin: 6px 0; }
+.versions li { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 5px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.versions li:last-child { border-bottom: 0; }
+.versions li .spacer { flex: 1; }
+
+/* the Explain tab of the popup */
+.popup.mode-explain { width: min(560px, calc(100vw - 24px)); }
+.popup .explain { max-height: 50vh; overflow: auto; padding: 8px 12px; background: var(--bg-code); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 13.5px; }
+.popup .status { display: flex; align-items: center; gap: 8px; color: var(--fg-dim); font-size: 12.5px; padding: 8px 0; }

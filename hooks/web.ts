@@ -4,10 +4,14 @@
 import type {
   CommentTarget,
   Diagram,
+  Explanation,
   FileCache,
   GeneratedBody,
   Lang,
+  LoadedVersion,
+  OkMark,
   PlanModel,
+  PlanVersion,
   QaItem,
   Review,
   ReviewComment,
@@ -25,6 +29,12 @@ export type WebAction =
   | { type: 'generateBody'; path: string; symbol: string }
   | { type: 'ask'; id?: string; question: string; focus?: string; target?: CommentTarget }
   | { type: 'askMore'; id: string; question: string }
+  | { type: 'explain'; id: string; target: CommentTarget; focus?: string }
+  | { type: 'setOk'; paths: string[]; ok: boolean }
+  | { type: 'editSummary'; text: string }
+  | { type: 'viewVersion'; version: number | null }
+  | { type: 'compareWith'; version: number | null }
+  | { type: 'restoreVersion'; version: number }
   | { type: 'generateDiagram' }
   | { type: 'callers'; path: string; symbol: string }
   | { type: 'diagramSvg'; svg: string }
@@ -38,6 +48,8 @@ export type ServerMessage =
   | { type: 'fatal'; text: string }
 
 const MAX_TEXT = 20000
+/** How long an edited summary may be: the plan file holds it whole. */
+const MAX_SUMMARY = 400_000
 
 /**
  * The shape of the state and the set of actions the mod understands. The page
@@ -52,6 +64,7 @@ export { WEB_PROTOCOL }
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 const str = (value: unknown, limit = MAX_TEXT): string | undefined => (typeof value === 'string' ? value.slice(0, limit) : undefined)
 const num = (value: unknown): number | undefined => (typeof value === 'number' && Number.isFinite(value) ? value : undefined)
+const ID = /^[A-Za-z0-9_-]{1,64}$/
 
 export function parseTarget(raw: unknown): CommentTarget {
   const target: CommentTarget = {}
@@ -68,6 +81,13 @@ export function parseTarget(raw: unknown): CommentTarget {
     if (a !== undefined && b !== undefined) target.lines = [Math.min(a, b), Math.max(a, b)]
   }
   return target
+}
+
+/** A plan version number as the page names one: a positive whole number; null for "the current plan". */
+function versionArg(raw: unknown): number | null | undefined {
+  if (raw === null || raw === undefined) return null
+  const value = num(raw)
+  return value !== undefined && value >= 1 && Number.isInteger(value) ? value : undefined
 }
 
 export function parseAction(raw: unknown): WebAction | null {
@@ -100,13 +120,40 @@ export function parseAction(raw: unknown): WebAction | null {
       const target = raw.target === undefined ? undefined : parseTarget(raw.target)
       const hasTarget = target !== undefined && Object.keys(target).length > 0
       const id = str(raw.id, 64)
-      const validId = id && /^[A-Za-z0-9_-]+$/.test(id) ? id : undefined
+      const validId = id && ID.test(id) ? id : undefined
       return { type: 'ask', question, ...(validId ? { id: validId } : {}), ...(focus ? { focus } : {}), ...(hasTarget ? { target } : {}) }
     }
     case 'askMore': {
       const id = str(raw.id, 64)
       const question = str(raw.question)?.trim()
       return id && question ? { type: 'askMore', id, question } : null
+    }
+    case 'explain': {
+      const id = str(raw.id, 64)
+      if (!id || !ID.test(id)) return null
+      const focus = str(raw.focus, 2000)
+      return { type: 'explain', id, target: parseTarget(raw.target), ...(focus ? { focus } : {}) }
+    }
+    case 'setOk': {
+      const list = Array.isArray(raw.paths) ? raw.paths : [raw.path]
+      const paths = [...new Set(list.map(one => str(one, 2000)).filter((one): one is string => Boolean(one)))]
+      return paths.length ? { type: 'setOk', paths, ok: raw.ok !== false } : null
+    }
+    case 'editSummary': {
+      const text = str(raw.text, MAX_SUMMARY)
+      return typeof text === 'string' ? { type: 'editSummary', text: text.replace(/\r\n?/g, '\n').trimEnd() } : null
+    }
+    case 'viewVersion': {
+      const version = versionArg(raw.version)
+      return version === undefined ? null : { type: 'viewVersion', version }
+    }
+    case 'compareWith': {
+      const version = versionArg(raw.version)
+      return version === undefined ? null : { type: 'compareWith', version }
+    }
+    case 'restoreVersion': {
+      const version = versionArg(raw.version)
+      return version ? { type: 'restoreVersion', version } : null
     }
     case 'generateDiagram':
       return { type: 'generateDiagram' }
@@ -200,6 +247,11 @@ export function buildSnapshot(args: {
   qa: QaItem[]
   diagram: Diagram
   files: FileCache
+  ok?: Record<string, OkMark>
+  explanations?: Record<string, Explanation>
+  versions?: PlanVersion[]
+  compare?: LoadedVersion | null
+  viewing?: LoadedVersion | null
   lang: Lang
   summaryLimit: number
   cwd: string
@@ -214,6 +266,11 @@ export function buildSnapshot(args: {
     qa: args.qa,
     diagram: args.diagram,
     files: fileEntries(args.plan, args.files),
+    ok: args.ok ?? {},
+    explanations: args.explanations ?? {},
+    versions: args.versions ?? [],
+    ...(args.compare ? { compare: args.compare } : {}),
+    ...(args.viewing ? { viewing: { ...args.viewing, files: fileEntries(args.viewing.plan, args.files) } } : {}),
     lang: args.lang,
     summaryLimit: args.summaryLimit,
     cwd: args.cwd,

@@ -1,7 +1,9 @@
 // Code blocks: a source listing and a unified diff, each line numbered and
 // carrying data-line so a mouse selection maps back to line numbers. With
 // `inline`, a planned symbol's stub gets a Show implementation button and the
-// generated code takes the stub's place in the block.
+// generated code takes the stub's place in the block: for a modified symbol
+// the lines of its current code stay above it as `-` lines, so the block
+// reads like a git diff.
 import { escapeHtml } from './markdown.js'
 import { highlight } from './highlight.js'
 import { t } from './i18n.js'
@@ -14,7 +16,7 @@ function cap(lines) {
   return { lines: lines.slice(0, MAX_LINES), note: `… ${lines.length - MAX_LINES} more lines not shown` }
 }
 
-function splitLines(text) {
+export function splitLines(text) {
   const all = String(text ?? '').replace(/\r\n?/g, '\n').split('\n')
   if (all.length > 1 && all[all.length - 1] === '') all.pop()
   return all
@@ -55,6 +57,24 @@ export function findStubRegions(texts, symbols) {
     }
   }
   return regions
+}
+
+/**
+ * The `-` lines right above a symbol's stub in a unified diff: the code the
+ * symbol has today when the plan modifies it. Empty when the diff holds none.
+ */
+export function oldLinesBefore(diffText, symbol) {
+  const lines = splitLines(diffText)
+  const texts = lines.map(raw => (raw[0] === '+' ? raw.slice(1) : null))
+  const regions = findStubRegions(texts, [symbol])
+  const start = [...regions.keys()][0]
+  if (start === undefined) return []
+  let index = start - 1
+  // The stub's own comment lines (the symbol's description) sit between the old code and the signature.
+  while (index >= 0 && lines[index][0] === '+' && /^\s*(\/\/|#|--|<!--|;;|\*)/.test(lines[index].slice(1))) index -= 1
+  const old = []
+  for (; index >= 0 && lines[index][0] === '-'; index -= 1) old.unshift(lines[index].slice(1))
+  return old
 }
 
 function actionsFor(inline, symbol) {
@@ -119,7 +139,7 @@ export function renderSource(code, { path = '', startLine = 1, commented = new S
   return `<div class="code source${commented.size ? ' marked' : ''}">${rows.join('')}${note ? `<div class="cap">${escapeHtml(note)}</div>` : ''}</div>`
 }
 
-export function renderDiff(diff, { path = '', commented = new Set(), inline = null } = {}) {
+export function renderDiff(diff, { path = '', commented = new Set(), inline = null, headers = true } = {}) {
   const { lines, note } = cap(splitLines(diff))
   const texts = lines.map(raw => (raw[0] === '+' ? raw.slice(1) : null))
   const regions = inline ? findStubRegions(texts, inline.symbols) : new Map()
@@ -134,7 +154,7 @@ export function renderDiff(diff, { path = '', commented = new Set(), inline = nu
         oldLine = Number(match[1])
         newLine = Number(match[2])
       }
-      rows.push(`<div class="line hunk"><span class="ln old"></span><span class="ln"></span><span class="sign"></span><span class="src">${escapeHtml(raw)}</span></div>`)
+      if (headers) rows.push(`<div class="line hunk"><span class="ln old"></span><span class="ln"></span><span class="sign"></span><span class="src">${escapeHtml(raw)}</span></div>`)
       continue
     }
     if (raw.startsWith('---') || raw.startsWith('+++') || raw.startsWith('diff ') || raw.startsWith('index ')) {
@@ -181,4 +201,23 @@ export function renderDiff(diff, { path = '', commented = new Set(), inline = nu
     )
   }
   return `<div class="code diff${commented.size ? ' marked' : ''}">${rows.join('')}${note ? `<div class="cap">${escapeHtml(note)}</div>` : ''}</div>`
+}
+
+/**
+ * A diff that replaces `oldLines` with `newCode`: what a modified symbol's
+ * implementation looks like next to the code it replaces. The new lines are
+ * numbered from 1, as the generated body is elsewhere, so comments on them
+ * keep their line numbers.
+ */
+export function renderReplaceDiff(oldLines, newCode, { path = '', commented = new Set() } = {}) {
+  const added = splitLines(newCode)
+  const text = [`@@ -1,${oldLines.length} +1,${added.length} @@`, ...oldLines.map(line => `-${line}`), ...added.map(line => `+${line}`)].join('\n')
+  return renderDiff(text, { path, commented, headers: false })
+}
+
+/** A diff that removes `code` whole: what a deleted symbol looks like. */
+export function renderDeletion(code, { path = '' } = {}) {
+  const gone = splitLines(code)
+  const text = [`@@ -1,${gone.length} +0,0 @@`, ...gone.map(line => `-${line}`)].join('\n')
+  return renderDiff(text, { path, headers: false })
 }
