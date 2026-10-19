@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Plan Crutches: review Claude's plan before it writes code</title>
+  <meta name="description" content="Plan Crutches is a mod for Claude Code. It opens the plan from plan mode as a review page in your browser: the change tree, signatures and git-style diffs of the changed methods, comments on anything you select, a 3D diagram, plan versions and a Submit button that sends your comments back to Claude." />
+  <meta name="color-scheme" content="light dark" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Plan Crutches" />
+  <meta property="og:description" content="Review Claude's plan before it writes code. A mod for Claude Code." />
+  <meta property="og:url" content="https://s-rybak.github.io/plan-crutches/" />
+  <meta property="og:image" content="https://s-rybak.github.io/plan-crutches/assets/og.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%235b6cff'/%3E%3Cpath d='M9 10h14M9 16h10M9 22h7' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E" />
+  <style>
+    :root {
+      --font: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      --bg: #f6f7fb;
+      --bg-elev: #ffffff;
+      --bg-code: #f1f3f9;
+      --fg: #1c2030;
+      --fg-dim: #6b7085;
+      --border: #e1e4ee;
+      --shadow: 0 10px 30px rgba(20, 24, 50, 0.12);
+      --accent: #5b6cff;
+      --accent-fg: #ffffff;
+      --accent-soft: #e8ebff;
+      --new: #1f9d55;
+      --new-soft: #e3f6ea;
+      --mod: #d9850b;
+      --mod-soft: #fff1dc;
+      --del: #d64545;
+      --del-soft: #fde6e6;
+      --comment: #7c3aed;
+      --comment-soft: #f1e9ff;
+      --nav-bg: rgba(255, 255, 255, 0.82);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #12141c;
+        --bg-elev: #1a1d28;
+        --bg-code: #151823;
+        --fg: #e6e8f0;
+        --fg-dim: #9299b0;
+        --border: #2a2f40;
+        --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+        --accent: #7b8aff;
+        --accent-fg: #0d1020;
+        --accent-soft: #262b4a;
+        --new: #3ccf7a;
+        --new-soft: #173126;
+        --mod: #f0a63a;
+        --mod-soft: #3a2b14;
+        --del: #ff6b6b;
+        --del-soft: #3d1c1c;
+        --comment: #c4a6ff;
+        --comment-soft: #2b2340;
+        --nav-bg: rgba(26, 29, 40, 0.82);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: var(--font);
+      color: var(--fg);
+      background: var(--bg);
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+    [id] { scroll-margin-top: 72px; }
+
+    .nav {
+      position: sticky; top: 0; z-index: 10;
+      background: var(--nav-bg);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav .wrap { display: flex; align-items: center; gap: 18px; height: 56px; }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; color: var(--fg); font-size: 16px; }
+    .brand:hover { text-decoration: none; }
+    .logo { width: 26px; height: 26px; border-radius: 7px; background: var(--accent); display: grid; place-items: center; flex: none; }
+    .logo svg { width: 18px; height: 18px; }
+    .nav-links { margin-left: auto; display: flex; gap: 20px; font-size: 14px; }
+    .nav-links a { color: var(--fg-dim); font-weight: 500; }
+    .nav-links a.gh { color: var(--fg); }
+
+    .hero { padding: 64px 0 20px; text-align: center; }
+    .eyebrow {
+      display: inline-block; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--accent); background: var(--accent-soft); padding: 4px 11px; border-radius: 999px;
+    }
+    h1 {
+      font-size: clamp(34px, 5.4vw, 58px); line-height: 1.06; letter-spacing: -0.025em;
+      margin: 18px auto 16px; max-width: 17ch;
+    }
+    .lead { font-size: 18px; color: var(--fg-dim); max-width: 66ch; margin: 0 auto; }
+    .cta { display: flex; gap: 12px; justify-content: center; margin: 28px 0 12px; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px; padding: 10px 18px; border-radius: 10px;
+      border: 1px solid var(--border); background: var(--bg-elev); color: var(--fg); font-weight: 600; font-size: 15px;
+    }
+    .btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+    .btn:hover { text-decoration: none; filter: brightness(1.06); }
+    .btn svg { width: 18px; height: 18px; }
+    .meta { font-size: 13px; color: var(--fg-dim); margin: 0; }
+
+    .shot { margin: 0; }
+    .shot img {
+      display: block; width: 100%; height: auto;
+      border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); background: var(--bg-elev);
+    }
+    .shot figcaption { font-size: 13px; color: var(--fg-dim); text-align: center; margin-top: 10px; }
+    .hero .shot { margin-top: 40px; }
+    .shot.narrow { max-width: 380px; margin-inline: auto; }
+    .shot.strip img { box-shadow: none; }
+
+    section { padding: 56px 0 24px; }
+    h2 { font-size: clamp(26px, 3.4vw, 36px); letter-spacing: -0.02em; line-height: 1.15; margin: 0 0 10px; }
+    .sub { color: var(--fg-dim); font-size: 17px; max-width: 66ch; margin: 0 0 28px; }
+    h3 { font-size: 17px; margin: 22px 0 8px; }
+
+    .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+    .card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+    .card h3 { margin: 10px 0 6px; font-size: 17px; }
+    .card p { margin: 0; color: var(--fg-dim); font-size: 15px; }
+    .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    .chip {
+      display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+      padding: 2px 8px; border-radius: 999px; border: 1px solid transparent;
+    }
+    .chip.new { color: var(--new); background: var(--new-soft); }
+    .chip.mod { color: var(--mod); background: var(--mod-soft); }
+    .chip.del { color: var(--del); background: var(--del-soft); }
+    .chip.cm { color: var(--comment); background: var(--comment-soft); }
+    .chip.ac { color: var(--accent); background: var(--accent-soft); }
+
+    .steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; counter-reset: step; }
+    .step { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+    .step::before {
+      counter-increment: step; content: counter(step);
+      display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 50%;
+      background: var(--accent); color: var(--accent-fg); font-weight: 700; font-size: 14px; margin-bottom: 10px;
+    }
+    .step h3 { margin: 0 0 6px; font-size: 16px; }
+    .step p { margin: 0; color: var(--fg-dim); font-size: 15px; }
+    .loop { margin: 18px 0 0; color: var(--fg-dim); font-size: 15px; }
+    .approve { margin-top: 24px; }
+
+    .feature {
+      display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 44px; align-items: center;
+      padding: 36px 0;
+    }
+    .feature + .feature { border-top: 1px solid var(--border); }
+    .feature.flip { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); }
+    .feature.flip .copy { order: 2; }
+    .copy h3 { font-size: 24px; letter-spacing: -0.015em; margin: 0 0 10px; line-height: 1.2; }
+    .copy p { color: var(--fg-dim); margin: 0 0 10px; font-size: 16px; }
+    .copy ul { margin: 0 0 10px; padding-left: 18px; color: var(--fg-dim); font-size: 16px; }
+    .copy li { margin: 2px 0; }
+    .stack { display: grid; gap: 16px; }
+
+    .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .grid2 .card p { font-size: 15px; }
+
+    pre {
+      background: var(--bg-code); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
+      overflow-x: auto; font-family: var(--mono); font-size: 13.5px; line-height: 1.5; margin: 8px 0 14px;
+    }
+    code { font-family: var(--mono); font-size: 0.92em; background: var(--bg-code); padding: 1px 5px; border-radius: 5px; overflow-wrap: anywhere; }
+    pre code { background: none; padding: 0; font-size: inherit; }
+    .two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 36px; }
+    .two h3:first-child { margin-top: 0; }
+    .two p, .two li { color: var(--fg-dim); font-size: 15px; }
+    .two ul { padding-left: 18px; margin: 0 0 10px; }
+
+    .tbl { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+    th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--fg-dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+    td code { white-space: nowrap; }
+
+    footer { border-top: 1px solid var(--border); margin-top: 40px; padding: 28px 0 56px; color: var(--fg-dim); font-size: 14px; }
+    footer p { margin: 0 0 8px; }
+
+    @media (max-width: 880px) {
+      .cards, .steps, .grid2, .two { grid-template-columns: minmax(0, 1fr); }
+      .feature, .feature.flip { grid-template-columns: minmax(0, 1fr); gap: 20px; padding: 28px 0; }
+      .feature.flip .copy { order: 0; }
+      .nav-links a:not(.gh) { display: none; }
+      .hero { padding-top: 44px; }
+      .lead { font-size: 16px; }
+      section { padding: 40px 0 16px; }
+    }
+  </style>
+</head>
+<body>
+  <nav class="nav">
+    <div class="wrap">
+      <a class="brand" href="#top"><span class="logo"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M9 10h14M9 16h10M9 22h7" stroke="white" stroke-width="3.5" stroke-linecap="round" fill="none"/></svg></span>Plan Crutches</a>
+      <div class="nav-links">
+        <a href="#how">How it works</a>
+        <a href="#features">Features</a>
+        <a href="#install">Install</a>
+        <a href="#reference">Reference</a>
+        <a class="gh" href="https://github.com/s-rybak/plan-crutches">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <header class="hero" id="top">
+    <div class="wrap">
+      <span class="eyebrow">A mod for Claude Code</span>
+      <h1>Review Claude's plan before it writes code</h1>
+      <p class="lead">Plan Crutches opens the plan from plan mode as a review page in your browser. You see the change tree, the signatures of new and changed methods and a diff against your files. You comment on anything you select, tick files as OK and press Submit. Claude revises the plan, or starts the implementation when nothing is pending.</p>
+      <div class="cta">
+        <a class="btn primary" href="#install">Install</a>
+        <a class="btn" href="https://github.com/s-rybak/plan-crutches"><svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>View on GitHub</a>
+      </div>
+      <p class="meta">Open source, MIT license · Claude Code 2.1.275 or newer · Node 18 or newer</p>
+      <figure class="shot">
+        <picture>
+          <source srcset="assets/hero-dark.webp" media="(prefers-color-scheme: dark)" />
+          <img src="assets/hero-light.webp" width="1280" height="840" alt="The review page: the header with the plan title, the version list, the review status, the count of comments and OK files and the Submit button; the Changes tab with the change tree on the left and the file src/auth/user.ts on the right, where the modified method getCurrentUser shows as removed and added lines and the deleted method displayNameOf as removed lines." />
+        </picture>
+        <figcaption>The review page with the demo plan: the change tree with OK marks and comment counts, a modified file with its git-style diff, and three comments ready to go back to Claude.</figcaption>
+      </figure>
+    </div>
+  </header>
+
+  <section id="why">
+    <div class="wrap">
+      <h2>Plan mode gives you a Markdown file and a Yes button</h2>
+      <p class="sub">A plan for a real task names a dozen files and twice as many methods. Plan Crutches turns that text into a change you can read like a pull request, before any of it exists.</p>
+      <div class="cards">
+        <div class="card">
+          <div class="chips"><span class="chip new">new</span><span class="chip mod">mod</span><span class="chip del">del</span></div>
+          <h3>See the shape of the change</h3>
+          <p>Every folder, file and symbol the plan touches, marked new, modified or deleted. A changed method shows as a git-style diff: its current code as removed lines, the planned code as added lines.</p>
+        </div>
+        <div class="card">
+          <div class="chips"><span class="chip cm">comment</span><span class="chip ac">v2</span></div>
+          <h3>Say exactly what to change</h3>
+          <p>Select a signature, a line of the diff or a sentence of the summary and comment on it. Submit sends the comments to Claude as the next message. The next version of the plan marks them resolved.</p>
+        </div>
+        <div class="card">
+          <div class="chips"><span class="chip ac">127.0.0.1</span><span class="chip ac">files</span></div>
+          <h3>A local page and plain files</h3>
+          <p>The page is plain HTML served on 127.0.0.1 by a small Node server. Every comment, version and record is a file under <code>~/.claude/plan-crutches</code>, so a review survives a restart of Claude Code.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="wrap">
+      <h2>How it works</h2>
+      <p class="sub">The mod sits between plan mode and the implementation. It intercepts the moment Claude leaves plan mode and holds it until you are done.</p>
+      <div class="steps">
+        <div class="step">
+          <h3>You start plan mode</h3>
+          <p>Give Claude a task as usual. The mod adds one instruction to the plan mode reminder.</p>
+        </div>
+        <div class="step">
+          <h3>Claude writes the plan</h3>
+          <p>The plan file ends with a <code>plan-crutches</code> JSON block that lists every file and marks every symbol as new, modified or deleted.</p>
+        </div>
+        <div class="step">
+          <h3>The page opens</h3>
+          <p>When Claude calls <code>ExitPlanMode</code>, the mod reads the plan file, starts the page server, opens the page and tells Claude to wait.</p>
+        </div>
+        <div class="step">
+          <h3>You review</h3>
+          <p>Open files, tick them as OK, comment on folders, files, symbols or selected text, ask questions, build the diagram.</p>
+        </div>
+        <div class="step">
+          <h3>Submit sends the comments</h3>
+          <p>Your comments go to Claude as the next message. Claude updates the plan file and calls <code>ExitPlanMode</code> again. The page shows version 2 with your comments resolved.</p>
+        </div>
+        <div class="step">
+          <h3>Submit with nothing pending approves</h3>
+          <p>Claude Code shows its own plan dialog once. Press Yes there and the implementation starts.</p>
+        </div>
+      </div>
+      <p class="loop">Steps 4 and 5 repeat until nothing is pending. When every file is marked OK and no comment waits, the Submit button becomes Approve plan:</p>
+      <figure class="shot strip approve">
+        <picture>
+          <source srcset="assets/approve-dark.webp" media="(prefers-color-scheme: dark)" />
+          <img src="assets/approve-light.webp" width="1280" height="53" alt="The page header with the badge OK 5 / 5 and the button Approve plan." />
+        </picture>
+      </figure>
+    </div>
+  </section>
+
+  <section id="features">
+    <div class="wrap">
+      <h2>What is on the page</h2>
+      <p class="sub">Four tabs: Changes, Diagram, Ask and Comments. The header and the tabs stay at the top while you scroll. Every screenshot below is the demo plan that ships with the mod.</p>
+
+      <div class="feature">
+        <div class="copy">
+          <h3>Changes by folder, with OK marks</h3>
+          <p>The tree shows every folder and file the plan touches, its status and the number of comments on it. Click a file to open it, click the speech bubble to comment on it.</p>
+          <p>Tick a file as OK when it needs no comments. The box of a folder ticks every file under it. When a new version changes a file, the mod clears its OK mark, so nothing changed slips through unseen. The header counts the OK files.</p>
+        </div>
+        <figure class="shot narrow">
+          <picture>
+            <source srcset="assets/tree-dark.webp" media="(prefers-color-scheme: dark)" />
+            <img src="assets/tree-light.webp" width="340" height="342" alt="The change tree: folders docs/ and src/ with their files, OK boxes ticked on docs/auth.md and src/api/routes.ts, comment counts on session.ts, user.ts and tokens.ts, and the chips NEW, MOD, DEL and MIXED." />
+          </picture>
+        </figure>
+      </div>
+
+      <div class="feature flip">
+        <div class="copy">
+          <h3>Signatures and git-style diffs</h3>
+          <p>A file view lists each symbol with its highlighted signature and what the plan does to it. Below them, a diff against the current file. A modified method appears as git shows it: its current code as removed lines, the planned signature as added lines. A deleted method appears as removed lines only. The full file is one click away.</p>
+          <p>Expand implementation asks the model for the body of a symbol. The generated code takes the place of the stub right there, under the removed lines, and you can comment on its lines.</p>
+        </div>
+        <figure class="shot">
+          <picture>
+            <source srcset="assets/diff-dark.webp" media="(prefers-color-scheme: dark)" />
+            <img src="assets/diff-light.webp" width="896" height="356" alt="The section Signatures against the current file: the current getCurrentUser as five removed lines, the planned signature as added lines with a Show implementation button, and the deleted displayNameOf as removed lines." />
+          </picture>
+        </figure>
+      </div>
+
+      <div class="feature">
+        <div class="copy">
+          <h3>Comment on anything you select</h3>
+          <p>Select text with the mouse in a code block, the summary, the task or an answer. A popup opens next to the selection. A code comment keeps the line range and the selected text, and the lines stay marked in the diff.</p>
+          <p>Folders, files and symbols have their own comment buttons. Every comment is kept in the session state and in a Markdown record. Submit lists the pending comments and the OK files in the message to Claude.</p>
+        </div>
+        <figure class="shot">
+          <picture>
+            <source srcset="assets/popup-comment-dark.webp" media="(prefers-color-scheme: dark)" />
+            <img src="assets/popup-comment-light.webp" width="886" height="510" alt="Two added lines of the diff are selected. A popup titled selection, src/auth/user.ts, 2 lines selected quotes them and shows the tabs Comment, Ask and Explain with a comment typed in the Comment tab." />
+          </picture>
+        </figure>
+      </div>
+
+      <div class="feature flip">
+        <div class="copy">
+          <h3>Explain and Ask, right there</h3>
+          <p>The same popup has two more tabs. Explain says what the selected place is, where it sits in the project and why the plan changes it. The request goes out only when you open the tab, and the same place is explained once per version.</p>
+          <p>Ask starts a thread about the selection. Claude answers in the popup with the selection and its place as context, and you continue the conversation there. Add the conversation to a comment turns the thread into a comment on the same lines.</p>
+        </div>
+        <figure class="shot">
+          <picture>
+            <source srcset="assets/popup-explain-dark.webp" media="(prefers-color-scheme: dark)" />
+            <img src="assets/popup-explain-light.webp" width="886" height="676" alt="The popup on the same selection with the Explain tab open: three paragraphs headed What, Where and Why, and the buttons Explain again, Ask about it and Close." />
+          </picture>
+        </figure>
+      </div>
+
+      <div class="feature">
+        <div class="copy">
+          <h3>Questions become threads</h3>
+          <p>The Ask tab of the page answers from the plan and the session without changing either. Every question is a thread: Reply continues it with the earlier turns as context. A thread shows where it came from and the selected text, and it can become a comment.</p>
+          <p>Answered threads go into the Markdown record of the review.</p>
+        </div>
+        <figure class="shot">
+          <picture>
+            <source srcset="assets/ask-dark.webp" media="(prefers-color-scheme: dark)" />
+            <img src="assets/ask-light.webp" width="1280" height="702" alt="The Ask tab: a question box, then a thread from src/auth/user.ts lines 16 to 17 with a question, an answer, a follow-up question, its answer, the button Add the conversation to a comment and a reply box." />
+          </picture>
+        </figure>
+      </div>
+
+      <div class="feature flip">
+        <div class="copy">
+          <h3>A 3D diagram of the change</h3>
+          <p>Generate change diagram starts a clean session with read-only tools. It gets the plan, reads the project and answers with a graph. The page draws one block per planned file, colored by its status, with the symbols the plan changes and the calls between them.</p>
+          <p>Click a symbol to see every place in the project that calls it, in existing code too. Drag the board to rotate it, Shift and drag to pan, the wheel to zoom, 2D to flatten. Drag a block to move it. Save as SVG writes the diagram next to the Markdown record.</p>
+        </div>
+        <figure class="shot">
+          <picture>
+            <source srcset="assets/diagram-dark.webp" media="(prefers-color-scheme: dark)" />
+            <img src="assets/diagram-light.webp" width="1248" height="684" alt="The Diagram tab: a tilted board with blocks for session.ts, user.ts, auth.md, routes.ts and tokens.ts, arrows for the calls between their symbols, and the callers of getCurrentUser drawn as grey blocks for handlers.ts, Header.tsx, Profile.tsx and 23 other callers." />
+          </picture>
+        </figure>
+      </div>
+
+      <div class="feature">
+        <div class="copy">
+          <h3>Versions: see what changed, bring one back</h3>
+          <p>Every version of the plan is saved. Highlight changes shows the summary as a text diff against an earlier version and marks each file and symbol in the tree as added, changed or removed. A file the new version dropped stays as a crossed-out row.</p>
+          <p>The version list in the header opens an earlier version read-only. Bring this version back writes it into the plan file as the next version. The Comments tab lists every comment by state, the versions and the history of the review.</p>
+        </div>
+        <div class="stack">
+          <figure class="shot">
+            <picture>
+              <source srcset="assets/highlight-dark.webp" media="(prefers-color-scheme: dark)" />
+              <img src="assets/highlight-light.webp" width="1280" height="840" alt="Highlight changes is on: the summary shows 30 as removed text and 60 as added text, the tree carries chips added, changed and removed, middleware.ts is crossed out, and the symbol getCurrentUser shows its earlier description struck through." />
+            </picture>
+          </figure>
+          <figure class="shot">
+            <picture>
+              <source srcset="assets/versions-dark.webp" media="(prefers-color-scheme: dark)" />
+              <img src="assets/versions-light.webp" width="1248" height="659" alt="The Comments tab: three pending comments, two resolved comments from version 1, the versions v2 current and v1 with the buttons open, Highlight changes and Bring this version back, and the review history." />
+            </picture>
+          </figure>
+        </div>
+      </div>
+
+      <div class="feature flip">
+        <div class="copy">
+          <h3>Edit the summary, keep your wording</h3>
+          <p>Press Edit on the summary, change the text and Save to the plan. The text goes into the plan file, and the next revision prompt tells Claude to keep your wording. The task block above the summary shows the raw task, from the Jira issue Claude fetched or from your prompt.</p>
+        </div>
+        <figure class="shot">
+          <picture>
+            <source srcset="assets/summary-edit-dark.webp" media="(prefers-color-scheme: dark)" />
+            <img src="assets/summary-edit-light.webp" width="1248" height="327" alt="The summary card in edit mode: a text area with the summary Markdown and the buttons Cancel and Save to the plan." />
+          </picture>
+        </figure>
+      </div>
+
+      <h3 style="font-size: 22px; margin-top: 44px;">And the rest</h3>
+      <div class="grid2">
+        <div class="card">
+          <h3>A review survives a restart</h3>
+          <p>Resume the session and the review comes back on its own. In a new session in the same folder, <code>/plan-review restore</code> brings it back: the plan, the comments, the questions and the diagram.</p>
+        </div>
+        <div class="card">
+          <h3>Any plan file</h3>
+          <p><code>/plan-review open &lt;path&gt;</code> reviews a Markdown plan file without plan mode: a plan from an earlier session under <code>~/.claude/plans/</code>, or one you wrote by hand.</p>
+        </div>
+        <div class="card">
+          <h3>A Markdown record</h3>
+          <p>Every reviewed plan is recorded as Markdown under <code>~/.claude/plan-crutches/&lt;project&gt;/</code>, with every version of the plan and the SVG of the diagram next to it.</p>
+        </div>
+        <div class="card">
+          <h3>Light, dark, EN, UA</h3>
+          <p>The page follows your system theme or the toggle in the header, and speaks English or Ukrainian. The colors are CSS variables you can override in <code>web/custom.css</code>. The pane in Claude Code stays as a second view with the page link.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="wrap">
+      <h2>Install</h2>
+      <p class="sub">The repository is its own plugin marketplace. One command adds the marketplace and the plugin.</p>
+      <div class="two">
+        <div>
+          <h3>In a Claude Code terminal session</h3>
+          <pre><code>/plugin install plan-crutches --marketplace s-rybak/plan-crutches</code></pre>
+          <p>Claude Code asks to add the marketplace. Answer <code>y</code>, then pick a scope. The user scope loads the mod in every project.</p>
+          <h3>From a shell</h3>
+          <pre><code>claude plugin install plan-crutches --marketplace s-rybak/plan-crutches</code></pre>
+          <h3>In the desktop app</h3>
+          <p>Click <code>+</code> next to the prompt box, then Plugins, then Add marketplace with <code>s-rybak/plan-crutches</code>, then Add plugin.</p>
+          <h3>Update</h3>
+          <pre><code>claude plugin update plan-crutches</code></pre>
+          <p>Then <code>/reload-plugins</code> in a session. A session keeps the mod it loaded at its start, so start a new session after an update.</p>
+        </div>
+        <div>
+          <h3>What it needs</h3>
+          <ul>
+            <li>Claude Code 2.1.275 or newer.</li>
+            <li>Node 18 or newer on the machine where the session runs. The page server runs there and binds to 127.0.0.1 only.</li>
+            <li>A browser. The page opens in the browser pane of the Claude desktop app when there is one, else in the system browser.</li>
+          </ul>
+          <h3>Try the page without plan mode</h3>
+          <p>In a session with the mod installed:</p>
+          <pre><code>/plan-review demo</code></pre>
+          <p>Or from a clone of the repository, without the mod:</p>
+          <pre><code>node scripts/demo-server.mjs</code></pre>
+          <p>Then open <code>http://127.0.0.1:4818/?t=demo</code>. The demo server answers the page itself, with canned answers in place of the model.</p>
+          <h3>Security of the page</h3>
+          <p>The server answers only requests whose Host header names the local machine, and every API call carries a token made once per session. Project files are served under the same token, never from outside the project folder.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="reference">
+    <div class="wrap">
+      <h2>Reference</h2>
+      <p class="sub">The commands of the mod and its options. Set the options in <code>/config</code> or in <code>settings.json</code> under <code>pluginConfigs.plan-crutches.options</code>.</p>
+      <h3>Commands</h3>
+      <div class="tbl">
+        <table>
+          <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+          <tbody>
+            <tr><td><code>/plan-review</code></td><td>If the page server is not running, starts it. Opens the page and the pane.</td></tr>
+            <tr><td><code>/plan-review demo</code></td><td>Loads a demo plan so you can try the page without plan mode.</td></tr>
+            <tr><td><code>/plan-review open [path]</code></td><td>Opens a plan file for review without plan mode. With no path, it opens the plan file of this session, or else the newest file under <code>~/.claude/plans/</code>. The same file under review gets the next version and keeps the comments.</td></tr>
+            <tr><td><code>/plan-review url</code></td><td>Prints the page address with its token.</td></tr>
+            <tr><td><code>/plan-review restore</code></td><td>Brings back the stored review of this folder: the plan, the comments, the questions and the diagram.</td></tr>
+            <tr><td><code>/plan-review close</code></td><td>Closes the pane. The page keeps running.</td></tr>
+            <tr><td><code>/plan-review stop</code></td><td>Stops the page server.</td></tr>
+            <tr><td><code>/plan-review reset</code></td><td>Clears the review state.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>Options</h3>
+      <div class="tbl">
+        <table>
+          <thead><tr><th>Option</th><th>Default</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>language</code></td><td><code>en</code></td><td>Page and pane language, <code>en</code> or <code>uk</code>.</td></tr>
+            <tr><td><code>model</code></td><td><code>sonnet</code></td><td>Model for the light calls: plan structure extraction, the pick of project files for an implementation, the change diagram and its callers, and answers without a session fork.</td></tr>
+            <tr><td><code>bodyModel</code></td><td><code>opus</code></td><td>Model that writes method bodies. Empty means the <code>model</code> option.</td></tr>
+            <tr><td><code>plansDir</code></td><td><code>~/.claude/plan-crutches</code></td><td>Folder for the Markdown records and SVG files. A path under <code>~</code> or an absolute path is shared, with one subfolder per project. A relative path is a folder inside the project.</td></tr>
+            <tr><td><code>summaryLimit</code></td><td><code>9000</code></td><td>Characters of the summary shown before Show all.</td></tr>
+            <tr><td><code>port</code></td><td><code>4817</code></td><td>Port of the page server on 127.0.0.1. A taken port falls back to a free one.</td></tr>
+            <tr><td><code>openIn</code></td><td><code>auto</code></td><td>Where the page opens: <code>auto</code> tries the Claude desktop browser pane, then the system browser. <code>system</code> uses the system browser. <code>none</code> only shows the link.</td></tr>
+            <tr><td><code>nodePath</code></td><td>empty</td><td>Path of the node executable. Empty means node from PATH, then the usual install locations.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="wrap">
+      <p>Plan Crutches is open source under the MIT license, by <a href="https://github.com/s-rybak">Serhii Rybak</a>. Source, issues and the full README: <a href="https://github.com/s-rybak/plan-crutches">github.com/s-rybak/plan-crutches</a>.</p>
+      <p>The screenshots show the demo plan that ships with the mod. The demo server does not call the model, so the answers in the Explain and Ask screenshots are sample texts written for the demo plan.</p>
+    </div>
+  </footer>
+</body>
+</html>

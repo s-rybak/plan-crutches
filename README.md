@@ -2,6 +2,8 @@
 
 Plan Crutches is a mod for Claude Code. It shows Claude's plan in a review page in your browser before Claude writes any code. You see the task, a short summary, the change tree, the signatures of new and changed methods and a diff against the current files. A changed or deleted method shows as a git-style diff: its current code as removed lines, the planned code as added lines. You comment on folders, files, symbols or any text you select with the mouse. You tick a file as OK when it needs no comments, and you ask the page to explain any place of the plan. A 3D diagram shows the files and the calls the plan changes. Then you press Submit. With comments, Claude revises the plan and the page shows the next version. Without comments, Claude proceeds to implementation.
 
+The landing page with screenshots is at https://s-rybak.github.io/plan-crutches/.
+
 ## How it works
 
 1. You start plan mode and give Claude a task.
@@ -136,6 +138,16 @@ node --test tests/server.node.mjs tests/page.node.mjs
 ```
 
 The first two need Claude Code 2.1.275 or newer. The last one checks the page server end to end and the page modules that render Markdown, code, diffs, the tree and the diagram layout.
+
+## Landing page
+
+The landing page is `docs/index.html`, with its screenshots under `docs/assets/`. GitHub Pages serves the `docs/` folder of the `main` branch at https://s-rybak.github.io/plan-crutches/. To look at it on your machine, start the small static server and open http://127.0.0.1:4819/:
+
+```bash
+node scripts/landing-server.mjs
+```
+
+The screenshots show the demo plan in light and dark themes. `node scripts/landing-shots.mjs` takes them again with the installed Google Chrome. It starts the demo server, drives the page and writes the WebP files under `docs/assets/`. It needs `cwebp` on the PATH.
 
 ## Limits
 

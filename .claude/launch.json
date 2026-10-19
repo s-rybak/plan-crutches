@@ -7,6 +7,13 @@
       "runtimeArgs": ["scripts/demo-server.mjs"],
       "port": 4818,
       "url": "http://127.0.0.1:4818"
+    },
+    {
+      "name": "landing",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scripts/landing-server.mjs"],
+      "port": 4819,
+      "url": "http://127.0.0.1:4819"
     }
   ]
 }
