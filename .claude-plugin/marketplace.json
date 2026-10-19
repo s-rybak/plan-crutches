@@ -1,0 +1,14 @@
+{
+  "name": "plan-crutches",
+  "description": "Plan Crutches: a review page for Claude's plan before it runs",
+  "owner": {
+    "name": "Serhii Rybak"
+  },
+  "plugins": [
+    {
+      "name": "plan-crutches",
+      "source": "./",
+      "description": "Visual review of Claude's plan before it runs: a browser page with the change tree, OK marks per file, +/- diffs of the changed methods, comments, an Explain tab, plan versions, a 3D diagram and Q&A."
+    }
+  ]
+}

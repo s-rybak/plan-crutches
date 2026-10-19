@@ -81,6 +81,26 @@ A click on a symbol starts a second request. The mod first runs `git grep` for t
 
 The server binds to `127.0.0.1` only. It answers only requests whose `Host` header names the local machine. A web site that points its name at `127.0.0.1` gets a 403. Every API call carries a token that the mod makes once per session. The page gets the token from the link, keeps it in local storage and then removes it from the address bar. Project files are served under `/project/` with the same token, for images in the summary and for the Full file view. The server never serves a file outside the project folder. The state the mod pushes holds the plan and the signature diffs, not the text of the project files.
 
+## Install
+
+This repository is a plugin marketplace. In a terminal session of Claude Code, type:
+
+```
+/plugin install plan-crutches --marketplace s-rybak/plan-crutches
+```
+
+Claude Code asks to add the marketplace. Answer `y`, then pick a scope. The user scope loads the mod in every project.
+
+From a shell:
+
+```bash
+claude plugin install plan-crutches --marketplace s-rybak/plan-crutches
+```
+
+In the desktop app, `/plugin` does not run. Click + next to the prompt box, then Plugins, then Add marketplace with `s-rybak/plan-crutches`, then Add plugin.
+
+The mod needs Claude Code 2.1.275 or newer. The review page needs Node 18 or newer on the same machine. To get a new version, run `claude plugin update plan-crutches`, then `/reload-plugins` in a session.
+
 ## Run it from this folder
 
 The mod loads from a folder that Claude Code watches. In a terminal session:

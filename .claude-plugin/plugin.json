@@ -2,6 +2,19 @@
   "name": "plan-crutches",
   "version": "0.3.0",
   "description": "Visual review of Claude's plan before it runs: a browser page with the change tree, OK marks per file, signatures and +/- diffs of the changed methods, comments, an Explain tab, plan versions with compare and restore, a 3D diagram and Q&A.",
+  "author": {
+    "name": "Serhii Rybak",
+    "url": "https://github.com/s-rybak"
+  },
+  "homepage": "https://github.com/s-rybak/plan-crutches",
+  "repository": "https://github.com/s-rybak/plan-crutches",
+  "license": "MIT",
+  "keywords": [
+    "plan-mode",
+    "plan-review",
+    "code-review",
+    "mod"
+  ],
   "types": "./types/index.d.ts",
   "userConfig": {
     "language": {
