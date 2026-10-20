@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { QaItem } from '../types'
 import { DEMO_PLAN } from '../hooks/demo-plan'
 import { parsePlan } from '../hooks/plan-parser'
-import { approvePrompt, askMorePrompt, askPrompt, bodyPrompt, explainPrompt, importCandidates, parseFileList, pickFilesPrompt, planSurface, relativeImports, revisionPrompt, threadText } from '../hooks/prompts'
+import { approvePrompt, askMorePrompt, askPrompt, bodyPrompt, explainPrompt, importCandidates, parseFileList, pickFilesPrompt, planSurface, relativeImports, revisionPrompt, threadText, userWords } from '../hooks/prompts'
 import { renderRecord } from '../hooks/record'
 
 function demoPlan() {
@@ -115,8 +115,10 @@ describe('prompts', () => {
 
   test('the explanation prompt names the place, the planned symbol, the file text and the language', async () => {
     const plan = demoPlan()
-    const prompt = explainPrompt(plan, { path: 'src/auth/user.ts', symbol: 'getCurrentUser', lines: [3, 5], selection: 'readSession()' }, undefined, 'export function x() {}', 'uk')
-    expect(prompt).toContain('Answer in Ukrainian')
+    const prompt = explainPrompt(plan, { path: 'src/auth/user.ts', symbol: 'getCurrentUser', lines: [3, 5], selection: 'readSession()' }, undefined, 'export function x() {}', 'uk', 'Чому саме кеш?')
+    expect(prompt).toContain('Answer in the language the user writes in')
+    expect(prompt).toContain('quoted here: "Чому саме кеш?"')
+    expect(prompt).toContain('Only when there are none, answer in Ukrainian.')
     expect(prompt).toContain('What, Where and Why')
     expect(prompt).toContain('The place to explain: src/auth/user.ts, symbol getCurrentUser, lines 3-5.')
     expect(prompt).toContain('Planned symbol getCurrentUser [function, modified]:')
@@ -124,9 +126,22 @@ describe('prompts', () => {
     expect(prompt).toContain('readSession()')
     expect(prompt).toContain('All planned files and symbols:')
     const whole = explainPrompt(plan, {}, 'src/auth/session.ts')
-    expect(whole).toContain('Answer in English')
+    expect(whole).toContain('Only when there are none, answer in English.')
+    expect(whole).not.toContain('quoted here')
     expect(whole).toContain('The place to explain: src/auth/session.ts.')
     expect(whole).not.toContain('Current content of')
+  })
+
+  test('the user words for the answer language come from the latest questions, comments and the typed task', async () => {
+    const plan = demoPlan()
+    expect(userWords(plan)).toBe('')
+    const comments = [{ id: '1', target: {}, text: 'Залиш  менше\nфайлів.', createdInVersion: 1 }]
+    const qa: QaItem[] = [{ ...THREAD, followups: [{ id: 'f1', question: 'А транзакція?', status: 'done', answer: 'Так.' }] }]
+    expect(userWords(plan, comments, qa)).toBe('А транзакція? / Why a cache? / Залиш менше файлів.')
+    const typed = { ...plan, task: { source: 'user' as const, text: 'Зроби відправку листа' } }
+    expect(userWords(typed, [], [])).toBe('Зроби відправку листа')
+    expect(userWords(typed, comments, qa)).toBe('А транзакція? / Why a cache? / Залиш менше файлів.')
+    expect(userWords(plan, [{ id: '2', target: {}, text: 'x'.repeat(500), createdInVersion: 1 }]).length).toBeLessThanOrEqual(301)
   })
 
   test('the revision and approval prompts carry the OK marks and the summary edit', async () => {

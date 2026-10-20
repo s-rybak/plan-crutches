@@ -393,17 +393,55 @@ export function askMorePrompt(plan: PlanModel, item: QaItem, question: string): 
 }
 
 /**
+ * The user's own words in the review, newest first: the latest questions,
+ * comments and, when the user typed it, the task. The explanation follows
+ * their language. Empty when the user has written nothing yet.
+ */
+export function userWords(plan: PlanModel, comments: readonly ReviewComment[] = [], qa: readonly QaItem[] = [], limit = 300): string {
+  const words: string[] = []
+  for (const item of [...qa].reverse()) {
+    for (const followup of [...(item.followups ?? [])].reverse()) words.push(followup.question)
+    words.push(item.question)
+  }
+  for (const comment of [...comments].reverse()) words.push(comment.text)
+  if (plan.task.source === 'user' && plan.task.text) words.push(plan.task.text)
+  const picked: string[] = []
+  let length = 0
+  for (const raw of words) {
+    const text = raw.replace(/\s+/g, ' ').trim()
+    if (!text) continue
+    picked.push(text.slice(0, limit))
+    length += text.length
+    if (picked.length >= 3 || length >= limit) break
+  }
+  return cut(picked.join(' / '), limit)
+}
+
+/** The sentence that fixes the answer's language: the one the user writes in, with the page's language as the fallback. */
+function answerLanguage(lang: 'en' | 'uk', words?: string): string {
+  const fallback = lang === 'uk' ? 'Ukrainian' : 'English'
+  return (
+    'Answer in the language the user writes in: the language of the user\'s own messages in this conversation' +
+    (words ? ` and of the user's own words in this review, quoted here: "${words}"` : '') +
+    `. Only when there are none, answer in ${fallback}. The headings of the answer are in that language too.`
+  )
+}
+
+/**
  * The prompt of the popup's Explain tab: what the place the user points at
  * is, where it sits in the project and why the plan makes the change.
  * `fileText` is the current file when the mod has it, for the "where".
+ * `words` is the user's own text in the review (see userWords), which
+ * fixes the answer's language; `lang` is the page's language, the fallback.
  */
-export function explainPrompt(plan: PlanModel, target: CommentTarget, focus?: string, fileText?: string | null, lang: 'en' | 'uk' = 'en'): string {
+export function explainPrompt(plan: PlanModel, target: CommentTarget, focus?: string, fileText?: string | null, lang: 'en' | 'uk' = 'en', words?: string): string {
   const where = describeQaTarget(target) || focus || 'the whole plan'
   const file = target.path ? plan.files.find(one => one.path === target.path) : undefined
   const symbol = file && target.symbol ? file.symbols.find(one => one.name === target.symbol) : undefined
   const parts = [
     `Plan Crutches: explain one place of the plan "${plan.title}" currently under review to its reviewer. ` +
-      `Answer in ${lang === 'uk' ? 'Ukrainian' : 'English'}, in Markdown, under 250 words, with three short sections titled What, Where and Why: ` +
+      `${answerLanguage(lang, words)} ` +
+      'Write Markdown, under 250 words, with three short sections titled What, Where and Why (the titles translated into the answer\'s language): ' +
       'what this change is, where it sits in the project (the file, the symbol and what calls it or depends on it, as far as the plan and the code you know tell), and why the plan makes it (the task it serves and what would break without it). ' +
       'Do not change the plan and do not call tools.',
     planSurface(plan, ASK_SURFACE_LIMIT),

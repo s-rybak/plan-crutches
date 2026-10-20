@@ -333,8 +333,8 @@ async function takeShots(theme, outDir, pristine) {
     await scrollTop()
     {
       const card = await pageRect('.detail-card')
-      const titles = await page.eval(`[...document.querySelectorAll('.detail-card .section-title')].map(el => ({ text: el.textContent.trim(), y: el.getBoundingClientRect().top + window.scrollY }))`)
-      const sig = titles.find(one => /^Signatures/i.test(one.text))
+      const titles = await page.eval(`[...document.querySelectorAll('.detail-card .section-title')].map(el => ({ text: el.textContent.trim(), section: el.dataset.section || '', y: el.getBoundingClientRect().top + window.scrollY }))`)
+      const sig = titles.find(one => one.section === 'changes')
       const comments = titles.find(one => /^Comments/i.test(one.text))
       const bottom = comments ? comments.y - 10 : card.y + card.height
       if (sig) await shotClip('diff', { x: card.x, y: sig.y - 6, width: card.width, height: bottom - (sig.y - 6) })

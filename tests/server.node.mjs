@@ -2,7 +2,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import fs from 'node:fs'
 import http from 'node:http'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -119,5 +121,41 @@ test('falls back to a free port when the wanted one is taken', async () => {
     }
   } finally {
     first.child.kill('SIGTERM')
+  }
+})
+
+test('demo mode answers the comment actions itself: add, edit a pending one only, delete', async () => {
+  const demoFile = path.join(os.tmpdir(), `plan-crutches-demo-test-${process.pid}.json`)
+  fs.writeFileSync(
+    demoFile,
+    JSON.stringify({
+      review: { status: 'reviewing', version: 2, parsedFrom: 'block', warnings: [], history: [], previousPaths: [] },
+      comments: [{ id: 'sent', target: {}, text: 'Old', createdInVersion: 1, sentInVersion: 1 }],
+    }),
+  )
+  const server = startServer({ PLAN_CRUTCHES_DEMO: demoFile })
+  try {
+    let listening = await server.next()
+    while (listening.type === 'log') listening = await server.next()
+    const base = listening.url
+    const headers = { 'content-type': 'application/json', 'x-plan-crutches-token': 'testtoken' }
+    const post = action => fetch(`${base}/api/action`, { method: 'POST', headers, body: JSON.stringify(action) })
+    const comments = async () => (await (await fetch(`${base}/api/state`, { headers })).json()).comments
+
+    assert.equal((await post({ type: 'comment', target: { path: 'a.ts' }, text: 'First' })).status, 202)
+    let list = await comments()
+    assert.deepEqual(list.map(one => one.text), ['Old', 'First'])
+    const id = list[1].id
+    await post({ type: 'editComment', id, text: ' Second ' })
+    await post({ type: 'editComment', id: 'sent', text: 'Changed' })
+    await post({ type: 'editComment', id, text: '   ' })
+    list = await comments()
+    assert.deepEqual(list.map(one => one.text), ['Old', 'Second'], 'the pending comment takes the trimmed text; the sent one and an empty text change nothing')
+    assert.equal(list[1].createdInVersion, 2)
+    await post({ type: 'deleteComment', id })
+    assert.deepEqual((await comments()).map(one => one.id), ['sent'])
+  } finally {
+    server.child.kill('SIGTERM')
+    fs.rmSync(demoFile, { force: true })
   }
 })

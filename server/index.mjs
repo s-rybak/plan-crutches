@@ -59,7 +59,7 @@ const EMPTY_STATE = {
   summaryLimit: 9000,
   cwd: PROJECT_DIR,
   generatedAt: new Date().toISOString(),
-  protocol: 4,
+  protocol: 5,
 }
 
 let state = EMPTY_STATE
@@ -187,6 +187,11 @@ function handleDemoAction(action) {
     case 'deleteComment':
       state.comments = state.comments.filter(one => one.id !== action.id)
       break
+    case 'editComment': {
+      const text = typeof action.text === 'string' ? action.text.trim() : ''
+      if (text) state.comments = state.comments.map(one => (one.id === action.id && one.sentInVersion === undefined && one.resolvedInVersion === undefined ? { ...one, text } : one))
+      break
+    }
     case 'setLang':
       state.lang = action.lang === 'uk' ? 'uk' : 'en'
       break

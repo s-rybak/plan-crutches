@@ -3,7 +3,7 @@
 import { connect, act, projectUrl } from './api.js'
 import { t } from './i18n.js'
 import { renderMarkdown, escapeHtml } from './markdown.js'
-import { renderSource, renderDiff, renderReplaceDiff, renderDeletion, oldLinesBefore } from './codeview.js'
+import { renderSource, renderDiff, renderReplaceDiff, renderDeletion, oldLinesBefore, weaveDiff, deletionOfFile, stubbedSymbols } from './codeview.js'
 import { buildTree, renderTree, allDirKeys, pathsUnder } from './tree.js'
 import { mountDiagram } from './diagram.js'
 import { fileDeltas, symbolDeltas, folderDelta } from './compare.js'
@@ -35,9 +35,13 @@ const ui = {
   tab: 'changes',
   selected: null,
   collapsed: new Set(),
+  // The symbols whose generated body is open, in the file view and on the card alike.
   expanded: new Set(),
-  inlineExpanded: new Set(),
-  fullFile: new Set(),
+  // Files shown with every line, no folds; and per file, the folds the user opened.
+  unfoldedAll: new Set(),
+  unfolded: new Map(),
+  // The place in the file view that Expand implementation scrolled to, flashed for a moment.
+  reveal: null,
   fullText: new Map(),
   requested: new Set(),
   showFullSummary: false,
@@ -49,6 +53,7 @@ const ui = {
   replyOpen: new Set(),
   highlight: stored('plan-crutches-highlight', '0') === '1',
   editingSummary: false,
+  editingComment: null,
 }
 
 let state = null
@@ -74,7 +79,7 @@ function freshId(taken = state ? state.qa.map(one => one.id) : []) {
 // The state shape and the actions this page expects; hooks/web.ts carries the
 // same number. A session keeps the mod it started with, while this file comes
 // from disk, so an older mod behind a newer page gets a warning.
-const PROTOCOL = 4
+const PROTOCOL = 5
 const staleMod = () => Boolean(state && state.plan && state.protocol !== PROTOCOL)
 
 // ---------- what the page shows: the current plan, or an earlier version ----------
@@ -159,7 +164,8 @@ async function run(action) {
 }
 
 // The full text of a file is not in the state: the page reads it from the
-// server's /project/ route the first time the Full file button is pressed.
+// server's /project/ route when a modified file opens, and when every line
+// of a deleted file is asked for.
 async function loadFullFile(path) {
   if (ui.fullText.has(path)) return
   ui.fullText.set(path, { status: 'loading' })
@@ -173,11 +179,34 @@ async function loadFullFile(path) {
   render()
 }
 
-function renderFullFile(path) {
+/**
+ * The code view of a modified or deleted file, with the `mode` it ended in.
+ * A modified file shows whole, the diff's changes woven in at their place:
+ * folded to the changed lines (`folded`) or with every line (`all`). Until
+ * its text arrives there is a spinner (`loading`); when the text cannot be
+ * read, or no longer matches the diff, the plain diff stays with a note
+ * (`diff`). A deleted file shows the first lines of its diff (`deleted`) or
+ * every line as removed (`deleted-all`).
+ */
+function renderFileChanges(file, entry, { commented, inline }) {
+  const path = file.path
+  const diffHtml = entry.view ? block(renderDiff(entry.view.text, { path, commented, inline }), { path }) : ''
   const full = ui.fullText.get(path)
-  if (!full || full.status === 'loading') return `<div class="status hint"><span class="spinner"></span> ${L('loadingFile')}</div>`
-  if (full.status === 'failed') return `<div class="hint">${L('fileMissing')}</div>`
-  return block(renderSource(full.text, { path }), { path })
+  const allLines = ui.unfoldedAll.has(path)
+  const loading = `<div class="status hint"><span class="spinner"></span> ${L('loadingFile')}</div>`
+  const unreadable = `<div class="hint">${L('fileUnreadable')}</div>`
+  if (file.status === 'deleted') {
+    if (!allLines) return { mode: 'deleted', html: diffHtml }
+    if (!full || full.status === 'loading') return { mode: 'deleted-all', html: diffHtml + loading }
+    if (full.status === 'failed') return { mode: 'deleted-all', html: diffHtml + unreadable }
+    return { mode: 'deleted-all', html: block(renderDiff(deletionOfFile(full.text), { path, commented, headers: false }), { path }) }
+  }
+  if (!full || full.status === 'loading') return { mode: 'loading', html: loading }
+  if (full.status === 'failed') return { mode: 'diff', html: diffHtml + unreadable }
+  const woven = entry.view ? weaveDiff(full.text, entry.view.text) : null
+  if (woven === null) return { mode: 'diff', html: diffHtml + `<div class="hint">${L('fileChanged')}</div>` + block(renderSource(full.text, { path }), { path }) }
+  const fold = allLines ? null : { unfolded: ui.unfolded.get(path) || new Set(), lang }
+  return { mode: allLines ? 'all' : 'folded', html: block(renderDiff(woven, { path, commented, inline, headers: false, fold }), { path }) }
 }
 
 function pendingComments() {
@@ -200,17 +229,35 @@ function describeTarget(target) {
   return parts.join(' · ')
 }
 
+/**
+ * One comment card. A pending comment can be edited in place (the text turns
+ * into a textarea with Save and Cancel) or deleted; a sent or resolved one
+ * stays as Claude saw it.
+ */
 function renderComment(comment, { withOpen = false } = {}) {
   const kind = commentState(comment)
   const label = kind === 'pending' ? L('pending') : kind === 'sent' ? `${L('sent')} (v${comment.sentInVersion})` : `${L('resolved')} (v${comment.resolvedInVersion})`
   const open = withOpen && comment.target.path && !comment.target.path.endsWith('/') ? ` data-action="open-file" data-path="${escapeHtml(comment.target.path)}" style="cursor:pointer"` : ''
+  const id = escapeHtml(comment.id)
+  const editing = kind === 'pending' && ui.editingComment === comment.id
+  const text = editing
+    ? `<textarea class="comment-edit" data-draft="comment:${id}" data-comment-edit="${id}" rows="${Math.min(12, Math.max(2, comment.text.split('\n').length + 1))}">${escapeHtml(comment.text)}</textarea>` +
+      `<div class="edit-actions"><span class="hint"><kbd>Enter</kbd> ${L('save')} · <kbd>Esc</kbd> ${L('cancel')}</span><span class="spacer"></span>` +
+      `<button class="btn small" data-action="cancel-comment-edit">${L('cancel')}</button><button class="btn small primary" data-action="save-comment-edit" data-id="${id}">${L('save')}</button></div>`
+    : `<div class="text">${escapeHtml(comment.text)}</div>`
+  const tools =
+    kind === 'pending' && !editing
+      ? `<button class="tool" data-action="edit-comment" data-id="${id}" title="${L('editComment')}">✎</button>` +
+        `<button class="tool del" data-action="delete-comment" data-id="${id}" title="${L('delete')}">✕</button>`
+      : ''
   return (
-    `<div class="comment ${kind}">` +
+    `<div class="comment ${kind}${editing ? ' editing' : ''}">` +
     `<div class="body"><div class="where"${open}>${escapeHtml(describeTarget(comment.target))}</div>` +
     (comment.target.selection ? `<div class="quote">${escapeHtml(comment.target.selection.slice(0, 400))}</div>` : '') +
-    `<div class="text">${escapeHtml(comment.text)}</div></div>` +
+    text +
+    `</div>` +
     `<div class="state">${escapeHtml(label)}</div>` +
-    (kind === 'pending' ? `<button class="del" data-action="delete-comment" data-id="${comment.id}" title="${L('delete')}">✕</button>` : '') +
+    tools +
     `</div>`
   )
 }
@@ -254,7 +301,8 @@ function renderHeader() {
     action = `<button class="btn primary" data-action="submit">${pending ? L('submitWith', { n: pending }) : L('approve')}</button>`
   }
   const themeLabel = L(`theme_${ui.theme}`)
-  const record = review.recordPath ? `<span title="${escapeHtml(review.recordPath)}">${L('recorded')}: ${escapeHtml(review.recordPath.replace(`${state.cwd}/`, ''))}</span>` : ''
+  // The record path is long: it takes a line of its own under the badges, so the Submit button stays on the first line.
+  const record = review.recordPath ? `<div class="record" title="${escapeHtml(review.recordPath)}">${L('recorded')}: <span class="path">${escapeHtml(review.recordPath.replace(`${state.cwd}/`, ''))}</span></div>` : ''
   const okCount = plan && plan.files.length ? `<span class="badge ok${okCountOf(plan) === plan.files.length ? ' done' : ''}" title="${L('okTitle')}">${L('okCount', { n: okCountOf(plan), m: plan.files.length })}</span>` : ''
   return (
     `<header class="top">` +
@@ -266,7 +314,6 @@ function renderHeader() {
     (review.isDemo ? `<span class="badge">${L('demo')}</span>` : '') +
     (plan ? `<span>${state.comments.length} ${L('comments')}</span>` : '') +
     okCount +
-    record +
     `</div>` +
     `<span class="spacer"></span>` +
     `<div class="actions">` +
@@ -275,6 +322,7 @@ function renderHeader() {
     `<button class="btn ghost small" data-action="lang">${L('lang')}</button>` +
     action +
     `</div>` +
+    record +
     `</header>`
   )
 }
@@ -452,7 +500,12 @@ function deltaChipHtml(delta) {
 }
 
 /**
- * One symbol card. `context.entry` is the file's view (its diff holds the
+ * One symbol card: the signature, the description and the Expand
+ * implementation button. `context.placed` names the symbols whose stub the
+ * file view holds: their generated body shows there, in the stub's place,
+ * and the card only says how the generation goes. A symbol with no place in
+ * the file view (the file is missing, or its stub was not found) shows the
+ * body on the card. `context.entry` is the file's view (its diff holds the
  * code a modified symbol has today), `context.delta` and `context.previous`
  * come from the compare view, `context.readonly` hides the actions when an
  * earlier version is shown.
@@ -463,13 +516,17 @@ function renderSymbol(file, symbol, context) {
   const change = symbol.change || 'new'
   const { readonly, entry } = context
   const isExpanded = !readonly && ui.expanded.has(key)
-  const oldLines = change === 'modified' && entry && entry.view && entry.view.format === 'diff' ? oldLinesBefore(entry.view.text, symbol) : []
+  const inFile = Boolean(context.placed && context.placed.has(symbol.name))
   let bodyHtml = ''
   if (isExpanded) {
     if (!body || body.status === 'loading') bodyHtml = `<div class="status"><span class="spinner"></span>${L('generating')}</div>`
     else if (body.status === 'failed') bodyHtml = `<div class="status error">${L('generationFailed')}: ${escapeHtml(body.error || '')}</div>`
-    else if (oldLines.length) bodyHtml = block(renderReplaceDiff(oldLines, body.code || '', { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
-    else bodyHtml = block(renderSource(body.code || '', { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
+    else if (!inFile) {
+      const oldLines = change === 'modified' && entry && entry.view && entry.view.format === 'diff' ? oldLinesBefore(entry.view.text, symbol) : []
+      bodyHtml = oldLines.length
+        ? block(renderReplaceDiff(oldLines, body.code || '', { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
+        : block(renderSource(body.code || '', { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
+    }
   }
   const previous = context.previous
   const signatureChanged = context.delta === 'changed' && previous && previous.signature !== symbol.signature
@@ -483,13 +540,15 @@ function renderSymbol(file, symbol, context) {
   const note = change === 'deleted' ? `<div class="hint">${L('deletedSymbolNote')}</div>` : change === 'modified' ? `<div class="hint">${L('modifiedSymbolNote')}</div>` : ''
   let actions = ''
   if (!readonly) {
+    const where = `data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}"`
     if (change !== 'deleted') {
       actions += isExpanded
-        ? `<button class="btn small" data-action="collapse" data-key="${escapeHtml(key)}">${L('collapseImpl')}</button>` +
-          `<button class="btn small" data-action="regen" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">${L('regenerate')}</button>`
-        : `<button class="btn small" data-action="expand" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">${L('expandImpl')}</button>`
+        ? (inFile ? `<button class="btn small" data-action="show-in-file" ${where}>${L('showInFile')}</button>` : '') +
+          `<button class="btn small" data-action="collapse" ${where}>${L('collapseImpl')}</button>` +
+          `<button class="btn small" data-action="regen" ${where}>${L('regenerate')}</button>`
+        : `<button class="btn small" data-action="expand" ${where}>${L('expandImpl')}</button>`
     }
-    actions += `<button class="btn small" data-action="comment-symbol" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">💬</button>`
+    actions += `<button class="btn small" data-action="comment-symbol" ${where}>💬</button>`
   }
   return (
     `<div class="symbol change-${change}" data-symbol-card="${escapeHtml(symbol.name)}">` +
@@ -524,7 +583,7 @@ function inlineFor(file) {
     path: file.path,
     symbols: file.symbols,
     bodies: state.bodies,
-    expanded: ui.inlineExpanded,
+    expanded: ui.expanded,
     lang,
     commentedFor: symbol => linesCommented(file.path, symbol),
   }
@@ -550,20 +609,22 @@ function renderFile(file) {
   } else if (entry.missing) {
     changes = `<div class="hint">${L('fileMissing')}</div>`
   } else {
-    const title = file.status === 'deleted' ? L('deletedFile') : L('diffTitle')
-    const showFull = ui.fullFile.has(file.path)
-    changes =
-      `<div class="section-title">${title}<span class="spacer"></span>` +
-      `<button class="btn ghost small" data-action="full-file" data-path="${escapeHtml(file.path)}">${showFull ? L('hideFullFile') : L('fullFile')}</button>` +
-      `</div>` +
-      (entry.view ? block(renderDiff(entry.view.text, { path: file.path, commented: linesCommented(file.path), inline: file.status === 'modified' ? inline : null }), { path: file.path }) : '') +
-      (showFull ? `<div class="section-title">${L('fullFile')}</div>` + renderFullFile(file.path) : '')
+    const view = renderFileChanges(file, entry, { commented: linesCommented(file.path), inline: file.status === 'modified' ? inline : null })
+    const titles = { folded: 'foldedFileTitle', loading: 'foldedFileTitle', all: 'fullFileTitle', diff: 'diffTitle', deleted: 'deletedFile', 'deleted-all': 'deletedFile' }
+    // The diff of a deleted file is cut after its first lines; when it is whole, there is nothing more to show.
+    const cut = file.status === 'deleted' && entry.view && /\n-\.\.\. \d+ more lines$/.test(entry.view.text)
+    const toggles = { folded: 'showAllLines', all: 'foldUnchanged', deleted: cut ? 'showAllLines' : null, 'deleted-all': 'showLess' }
+    const toggle = toggles[view.mode] ? `<button class="btn ghost small" data-action="toggle-folds" data-path="${escapeHtml(file.path)}">${L(toggles[view.mode])}</button>` : ''
+    changes = `<div class="section-title" data-section="changes">${L(titles[view.mode])}<span class="spacer"></span>${toggle}</div>` + view.html
   }
+  // The symbols whose generated body has a place in the file view: the stub of each is there.
+  const placed = file.status !== 'deleted' && entry.loaded && !entry.missing ? stubbedSymbols(entry.view, file.symbols) : new Set()
   const comments = readonly ? [] : state.comments.filter(one => one.target.path === file.path)
   const symbols = file.symbols.map(symbol =>
     renderSymbol(file, symbol, {
       readonly,
       entry,
+      placed,
       delta: symbolDelta ? symbolDelta.byName.get(symbol.name) : null,
       previous: symbolDelta ? symbolDelta.previous.get(symbol.name) : null,
     }),
@@ -730,6 +791,7 @@ function render() {
   const panel = document.querySelector('.tree-panel')
   if (panel) panel.scrollTop = treeScroll
   measureTopbar()
+  flashReveal()
   requestFileIfNeeded()
 }
 
@@ -762,10 +824,49 @@ function requestFileIfNeeded() {
   const file = plan.files.find(one => one.path === ui.selected)
   if (!file || file.status === 'new') return
   const entry = shownFiles()[file.path]
+  // A modified file shows whole, so its text is read as soon as the file opens.
+  if (file.status === 'modified' && !(entry && entry.missing)) void loadFullFile(file.path)
   if (entry && entry.loaded) return
   if (ui.requested.has(file.path)) return
   ui.requested.add(file.path)
   run({ type: 'loadFile', path: file.path })
+}
+
+const REVEAL_MS = 1800
+
+/**
+ * Scrolls the file view to a symbol's generated body, or to its stub while
+ * the body is on its way, and flashes it. The page redraws when the body
+ * arrives, so the flash is kept in `ui.reveal` and drawn again after each
+ * redraw until its time is up: it ends on the body itself.
+ */
+function revealInFile(path, symbol) {
+  ui.reveal = { path, symbol, since: Date.now() }
+  const target = revealTarget()
+  if (!target) return
+  target.scrollIntoView({ block: 'center' })
+  flashReveal()
+}
+
+function revealTarget() {
+  const card = ui.reveal ? app.querySelector('.detail-card') : null
+  if (!card) return null
+  const name = CSS.escape(ui.reveal.symbol)
+  return card.querySelector(`.inline-body[data-path="${CSS.escape(ui.reveal.path)}"][data-symbol="${name}"]`) || card.querySelector(`[data-stub="${name}"]`)
+}
+
+/** Marks the revealed place; after a redraw the animation goes on from where it was. */
+function flashReveal() {
+  if (!ui.reveal) return
+  const elapsed = Date.now() - ui.reveal.since
+  if (elapsed >= REVEAL_MS) {
+    ui.reveal = null
+    return
+  }
+  const target = revealTarget()
+  if (!target) return
+  target.style.animationDelay = `-${elapsed}ms`
+  target.classList.add('flash')
 }
 
 function onState(next) {
@@ -778,11 +879,14 @@ function onState(next) {
     ui.planKey = planKey
     ui.requested.clear()
     ui.expanded.clear()
-    ui.inlineExpanded.clear()
-    ui.fullFile.clear()
+    ui.unfoldedAll.clear()
+    ui.unfolded.clear()
     ui.fullText.clear()
     ui.editingSummary = false
+    ui.editingComment = null
   }
+  // A comment that was sent or deleted meanwhile is no longer edited.
+  if (ui.editingComment && !pendingComments().some(one => one.id === ui.editingComment)) ui.editingComment = null
   const plan = shownPlan()
   if (ui.selected && !(plan && plan.files.some(one => one.path === ui.selected))) ui.selected = null
   if (next.notice && next.notice.id !== lastNotice) {
@@ -802,7 +906,7 @@ function onState(next) {
 // the plan changes it.
 
 function openPopup({ title, target, selection, prefill, at, mode = 'comment' }) {
-  popupState = { title, target: target || {}, selection: selection || '', prefill: prefill || '', at, mode, qaId: null, pending: null, explainId: null }
+  popupState = { title, target: target || {}, selection: selection || '', prefill: prefill || '', at, moved: null, mode, qaId: null, pending: null, explainId: null }
   if (mode === 'explain') requestExplanation()
   renderPopup({ focus: true })
 }
@@ -919,7 +1023,7 @@ function renderPopup({ focus = false, keepDraft = true } = {}) {
   }
   popup.className = `popup mode-${mode}`
   popup.innerHTML =
-    `<div class="ptitle"><span>${escapeHtml(title)}</span><span class="spacer"></span><button class="btn ghost small" data-popup="cancel">✕</button></div>` +
+    `<div class="ptitle" title="${escapeHtml(L('dragToMove'))}"><span>${escapeHtml(title)}</span><span class="spacer"></span><button class="btn ghost small" data-popup="cancel" title="${escapeHtml(L('close'))}">✕</button></div>` +
     (selection && !(mode === 'ask' && (item || pending)) ? `<div class="pquote">${escapeHtml(selection)}</div>` : '') +
     tabs +
     body
@@ -935,13 +1039,26 @@ function renderPopup({ focus = false, keepDraft = true } = {}) {
   }
 }
 
+/**
+ * Puts the popup next to its anchor, or where the user dragged it. A moved
+ * popup keeps its place while its content changes, and is kept inside the
+ * window when the content grows or the window shrinks.
+ */
 function placePopup() {
-  const { at } = popupState
+  const { at, moved } = popupState
   const width = popup.offsetWidth
   const height = popup.offsetHeight
-  const left = Math.min(Math.max(12, at.x), window.innerWidth - width - 12)
-  let top = at.y + 10
-  if (top + height > window.innerHeight - 12) top = Math.max(12, Math.min(at.y - height - 10, window.innerHeight - height - 12))
+  let left
+  let top
+  if (moved) {
+    left = Math.min(Math.max(0, moved.left), Math.max(0, window.innerWidth - width))
+    top = Math.min(Math.max(0, moved.top), Math.max(0, window.innerHeight - height))
+    popupState.moved = { left, top }
+  } else {
+    left = Math.min(Math.max(12, at.x), window.innerWidth - width - 12)
+    top = at.y + 10
+    if (top + height > window.innerHeight - 12) top = Math.max(12, Math.min(at.y - height - 10, window.innerHeight - height - 12))
+  }
   popup.style.left = `${left}px`
   popup.style.top = `${top}px`
 }
@@ -1045,6 +1162,52 @@ popup.addEventListener('keydown', event => {
   }
 })
 
+// ---------- moving the popup ----------
+// The title bar drags the window. The pointer is captured, so the drag goes on
+// outside the popup, and the mouseup that ends it opens no new popup from a
+// selection that is still on the page.
+
+let popupDrag = null
+let popupDragEndedAt = 0
+
+popup.addEventListener('pointerdown', event => {
+  if (event.button !== 0 || !popupState) return
+  if (!event.target.closest('.ptitle') || event.target.closest('button')) return
+  event.preventDefault()
+  const rect = popup.getBoundingClientRect()
+  popupDrag = { pointerId: event.pointerId, dx: event.clientX - rect.left, dy: event.clientY - rect.top }
+  popup.classList.add('dragging')
+  try {
+    popup.setPointerCapture(event.pointerId)
+  } catch {
+    // a synthetic pointer takes no capture; the drag still follows the pointer while it stays over the popup
+  }
+})
+
+popup.addEventListener('pointermove', event => {
+  if (!popupDrag || event.pointerId !== popupDrag.pointerId || !popupState) return
+  popupState.moved = { left: event.clientX - popupDrag.dx, top: event.clientY - popupDrag.dy }
+  placePopup()
+})
+
+function endPopupDrag(event) {
+  if (!popupDrag || event.pointerId !== popupDrag.pointerId) return
+  popupDrag = null
+  popupDragEndedAt = Date.now()
+  popup.classList.remove('dragging')
+  try {
+    popup.releasePointerCapture(event.pointerId)
+  } catch {
+    // already released
+  }
+}
+
+popup.addEventListener('pointerup', endPopupDrag)
+popup.addEventListener('pointercancel', endPopupDrag)
+window.addEventListener('resize', () => {
+  if (popupState && !popup.hidden) placePopup()
+})
+
 function rectOf(element) {
   const rect = element.getBoundingClientRect()
   return { x: rect.left, y: rect.bottom }
@@ -1083,6 +1246,7 @@ function checkSelection() {
 
 document.addEventListener('mouseup', event => {
   if (event.button !== 0) return
+  if (popupDrag || Date.now() - popupDragEndedAt < 250) return
   if (event.target.closest('#popup') || event.target.closest('button, textarea, input, select, .diagram-card')) return
   setTimeout(checkSelection, 0)
 })
@@ -1147,6 +1311,18 @@ app.addEventListener('keydown', event => {
     }
     return
   }
+  if (event.target.dataset.commentEdit) {
+    // Like the popup's composer: Enter saves, Shift+Enter adds a line, Esc cancels.
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      ui.editingComment = null
+      render()
+    } else if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault()
+      saveCommentEdit(event.target.dataset.commentEdit)
+    }
+    return
+  }
   if (event.key !== 'Enter') return
   // Enter sends, Shift+Enter adds a line; Cmd/Ctrl+Enter sends too.
   if (event.shiftKey) return
@@ -1189,6 +1365,25 @@ function saveSummary() {
     if (staleMod()) return toast(L('staleMod'))
     run({ type: 'editSummary', text })
   }
+  render()
+}
+
+function focusEnd(area) {
+  if (!area) return
+  area.focus({ preventScroll: true })
+  area.setSelectionRange(area.value.length, area.value.length)
+}
+
+/** Saves the edited text of a pending comment; an empty or unchanged text only closes the editor. */
+function saveCommentEdit(id) {
+  const area = app.querySelector(`textarea[data-comment-edit="${id}"]`)
+  const comment = state && state.comments.find(one => one.id === id)
+  const text = area ? area.value.trim() : ''
+  if (area && comment && text && text !== comment.text) {
+    if (staleMod()) return toast(L('staleMod'))
+    run({ type: 'editComment', id, text })
+  }
+  ui.editingComment = null
   render()
 }
 
@@ -1292,46 +1487,59 @@ function handleAction(control) {
     case 'comment-symbol':
       openPopup({ title: `${data.path} · ${data.symbol}`, target: { path: data.path, symbol: data.symbol }, at: rectOf(control) })
       break
-    case 'expand': {
+    // The card's Expand implementation and the file view's Show implementation
+    // open the same body, in the file view; the card's button also scrolls to it.
+    case 'expand':
+    case 'inline-expand': {
       const key = bodyKey(data.path, data.symbol)
       ui.expanded.add(key)
       const body = state.bodies[key]
       if (!body || body.status === 'failed') run({ type: 'generateBody', path: data.path, symbol: data.symbol })
       render()
+      if (action === 'expand') revealInFile(data.path, data.symbol)
       break
     }
     case 'collapse':
-      ui.expanded.delete(data.key)
-      render()
-      break
-    case 'inline-expand': {
-      const key = bodyKey(data.path, data.symbol)
-      ui.inlineExpanded.add(key)
-      const body = state.bodies[key]
-      if (!body || body.status === 'failed') run({ type: 'generateBody', path: data.path, symbol: data.symbol })
-      render()
-      break
-    }
     case 'inline-collapse':
-      ui.inlineExpanded.delete(bodyKey(data.path, data.symbol))
+      ui.expanded.delete(bodyKey(data.path, data.symbol))
       render()
       break
+    case 'show-in-file':
+      revealInFile(data.path, data.symbol)
+      break
+    case 'regen':
     case 'inline-regen':
       run({ type: 'generateBody', path: data.path, symbol: data.symbol })
       break
-    case 'regen':
-      run({ type: 'generateBody', path: data.path, symbol: data.symbol })
-      break
-    case 'full-file':
-      if (ui.fullFile.has(data.path)) ui.fullFile.delete(data.path)
+    case 'toggle-folds':
+      if (ui.unfoldedAll.has(data.path)) ui.unfoldedAll.delete(data.path)
       else {
-        ui.fullFile.add(data.path)
+        ui.unfoldedAll.add(data.path)
         void loadFullFile(data.path)
       }
       render()
       break
+    case 'unfold': {
+      const open = ui.unfolded.get(data.path) || new Set()
+      open.add(Number(data.fold))
+      ui.unfolded.set(data.path, open)
+      render()
+      break
+    }
     case 'delete-comment':
       run({ type: 'deleteComment', id: data.id })
+      break
+    case 'edit-comment':
+      ui.editingComment = data.id
+      render()
+      focusEnd(app.querySelector(`textarea[data-comment-edit="${data.id}"]`))
+      break
+    case 'cancel-comment-edit':
+      ui.editingComment = null
+      render()
+      break
+    case 'save-comment-edit':
+      saveCommentEdit(data.id)
       break
     case 'ask':
       submitQuestion()

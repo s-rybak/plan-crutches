@@ -67,6 +67,7 @@ import {
   bodyPrompt,
   denyMessage,
   explainPrompt,
+  userWords,
   extractionPrompt,
   importCandidates,
   parseFileList,
@@ -1231,7 +1232,7 @@ async function answerQuestion($: EngineInterface, plan: PlanModel, prompt: strin
     if (forked.reason !== 'nothing-to-fork') return { failure: forked.reason === 'api-error' ? `${forked.reason} ${forked.status}` : forked.reason }
     const direct = await $.model.complete({
       model: options.model,
-      system: `You answer questions about the implementation plan "${plan.title}", which is under review. Be brief; answer in the language of the question.`,
+      system: `You answer questions about the implementation plan "${plan.title}", which is under review. Be brief. Answer in the language the request asks for; when it asks for none, answer in the language of the question.`,
       prompt,
       maxTokens: 1500,
       timeoutMs: 90_000,
@@ -1312,7 +1313,7 @@ async function askMore($: EngineInterface, id: string, question: string): Promis
  * names the id so it can follow the answer.
  */
 async function explain($: EngineInterface, id: string, target: CommentTarget, focus?: string): Promise<void> {
-  const [plan, review, ui, known] = await Promise.all([read($, planAtom), read($, reviewAtom), read($, uiAtom), read($, explainAtom)])
+  const [plan, review, ui, known, comments, qa] = await Promise.all([read($, planAtom), read($, reviewAtom), read($, uiAtom), read($, explainAtom), read($, commentsAtom), read($, qaAtom)])
   if (!plan || known[id]) return
   await update($, explainAtom, map => ({ ...map, [id]: { status: 'asking' as const, target, ...(focus ? { focus } : {}), createdInVersion: review.version } }))
   changed($)
@@ -1322,7 +1323,7 @@ async function explain($: EngineInterface, id: string, target: CommentTarget, fo
     await loadFile($, path)
     fileText = (await read($, filesAtom))[path] ?? null
   }
-  const { answer, failure } = await answerQuestion($, plan, explainPrompt(plan, target, focus, fileText, ui.lang))
+  const { answer, failure } = await answerQuestion($, plan, explainPrompt(plan, target, focus, fileText, ui.lang, userWords(plan, comments, qa)))
   await update($, explainAtom, map => {
     const current = map[id]
     if (!current) return map
@@ -1430,6 +1431,16 @@ async function addComment($: EngineInterface, target: CommentTarget, text: strin
 
 async function deleteComment($: EngineInterface, id: string): Promise<void> {
   await update($, commentsAtom, list => list.filter(one => one.id !== id))
+  await writeRecord($)
+  changed($)
+}
+
+/** A new text for a pending comment. A sent or resolved comment stays as Claude saw it. */
+async function editComment($: EngineInterface, id: string, text: string): Promise<void> {
+  const comments = await read($, commentsAtom)
+  const comment = comments.find(one => one.id === id)
+  if (!comment || comment.sentInVersion !== undefined || comment.resolvedInVersion !== undefined || comment.text === text) return
+  await update($, commentsAtom, list => list.map(one => (one.id === id ? { ...one, text } : one)))
   await writeRecord($)
   changed($)
 }
@@ -1648,6 +1659,8 @@ async function handleAction($: EngineInterface, action: WebAction): Promise<void
       return addComment($, action.target, action.text)
     case 'deleteComment':
       return deleteComment($, action.id)
+    case 'editComment':
+      return editComment($, action.id, action.text)
     case 'submit':
       return submit($)
     case 'loadFile':

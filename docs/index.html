@@ -322,13 +322,13 @@
       <div class="feature flip">
         <div class="copy">
           <h3>Signatures and git-style diffs</h3>
-          <p>A file view lists each symbol with its highlighted signature and what the plan does to it. Below them, a diff against the current file. A modified method appears as git shows it: its current code as removed lines, the planned signature as added lines. A deleted method appears as removed lines only. The full file is one click away.</p>
-          <p>Expand implementation asks the model for the body of a symbol. The generated code takes the place of the stub right there, under the removed lines, and you can comment on its lines.</p>
+          <p>A file view lists each symbol with its highlighted signature and what the plan does to it. Below them, the whole file with the planned changes in place and the unchanged lines folded: one row stands for each run of them, and a click opens it. A modified method appears as git shows it: its current code as removed lines, the planned signature as added lines. A deleted method appears as removed lines only.</p>
+          <p>Before you ask for an implementation, the file shows only the planned signatures. Expand implementation asks the model for the body of a symbol. The generated code takes the place of the stub right there in the file, under the removed lines, and you can comment on its lines.</p>
         </div>
         <figure class="shot">
           <picture>
             <source srcset="assets/diff-dark.webp" media="(prefers-color-scheme: dark)" />
-            <img src="assets/diff-light.webp" width="896" height="356" alt="The section Signatures against the current file: the current getCurrentUser as five removed lines, the planned signature as added lines with a Show implementation button, and the deleted displayNameOf as removed lines." />
+            <img src="assets/diff-light.webp" width="896" height="373" alt="The file view of user.ts folded to its changes: one row stands for the twelve unchanged lines above, then the current getCurrentUser as five removed lines, the planned signature as added lines with a Show implementation button, and the deleted displayNameOf as removed lines." />
           </picture>
         </figure>
       </div>
@@ -342,7 +342,7 @@
         <figure class="shot">
           <picture>
             <source srcset="assets/popup-comment-dark.webp" media="(prefers-color-scheme: dark)" />
-            <img src="assets/popup-comment-light.webp" width="886" height="510" alt="Two added lines of the diff are selected. A popup titled selection, src/auth/user.ts, 2 lines selected quotes them and shows the tabs Comment, Ask and Explain with a comment typed in the Comment tab." />
+            <img src="assets/popup-comment-light.webp" width="886" height="528" alt="Two added lines of the diff are selected. A popup titled selection, src/auth/user.ts, 2 lines selected quotes them and shows the tabs Comment, Ask and Explain with a comment typed in the Comment tab." />
           </picture>
         </figure>
       </div>
@@ -350,13 +350,13 @@
       <div class="feature flip">
         <div class="copy">
           <h3>Explain and Ask, right there</h3>
-          <p>The same popup has two more tabs. Explain says what the selected place is, where it sits in the project and why the plan changes it. The request goes out only when you open the tab, and the same place is explained once per version.</p>
+          <p>The same popup has two more tabs. Explain says what the selected place is, where it sits in the project and why the plan changes it, in the language you write in. The request goes out only when you open the tab, and the same place is explained once per version.</p>
           <p>Ask starts a thread about the selection. Claude answers in the popup with the selection and its place as context, and you continue the conversation there. Add the conversation to a comment turns the thread into a comment on the same lines.</p>
         </div>
         <figure class="shot">
           <picture>
             <source srcset="assets/popup-explain-dark.webp" media="(prefers-color-scheme: dark)" />
-            <img src="assets/popup-explain-light.webp" width="886" height="676" alt="The popup on the same selection with the Explain tab open: three paragraphs headed What, Where and Why, and the buttons Explain again, Ask about it and Close." />
+            <img src="assets/popup-explain-light.webp" width="886" height="694" alt="The popup on the same selection with the Explain tab open: three paragraphs headed What, Where and Why, and the buttons Explain again, Ask about it and Close." />
           </picture>
         </figure>
       </div>
@@ -370,7 +370,7 @@
         <figure class="shot">
           <picture>
             <source srcset="assets/ask-dark.webp" media="(prefers-color-scheme: dark)" />
-            <img src="assets/ask-light.webp" width="1280" height="702" alt="The Ask tab: a question box, then a thread from src/auth/user.ts lines 16 to 17 with a question, an answer, a follow-up question, its answer, the button Add the conversation to a comment and a reply box." />
+            <img src="assets/ask-light.webp" width="1280" height="701" alt="The Ask tab: a question box, then a thread from src/auth/user.ts lines 16 to 17 with a question, an answer, a follow-up question, its answer, the button Add the conversation to a comment and a reply box." />
           </picture>
         </figure>
       </div>
@@ -419,7 +419,7 @@
         <figure class="shot">
           <picture>
             <source srcset="assets/summary-edit-dark.webp" media="(prefers-color-scheme: dark)" />
-            <img src="assets/summary-edit-light.webp" width="1248" height="327" alt="The summary card in edit mode: a text area with the summary Markdown and the buttons Cancel and Save to the plan." />
+            <img src="assets/summary-edit-light.webp" width="1248" height="326" alt="The summary card in edit mode: a text area with the summary Markdown and the buttons Cancel and Save to the plan." />
           </picture>
         </figure>
       </div>

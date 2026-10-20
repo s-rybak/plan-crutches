@@ -14,6 +14,9 @@ describe('web bridge helpers', () => {
       target: { path: 'a.ts', selection: 'x', lines: [2, 4] },
     })
     expect(parseAction({ type: 'comment', text: '   ' })).toBe(null)
+    expect(parseAction({ type: 'editComment', id: 'c1', text: '  Shorter. ' })).toEqual({ type: 'editComment', id: 'c1', text: 'Shorter.' })
+    expect(parseAction({ type: 'editComment', id: 'c1', text: '   ' })).toBe(null)
+    expect(parseAction({ type: 'editComment', text: 'x' })).toBe(null)
     expect(parseAction({ type: 'generateBody', path: 'a.ts', symbol: 'f' })).toEqual({ type: 'generateBody', path: 'a.ts', symbol: 'f' })
     expect(parseAction({ type: 'ask', question: 'Why?', focus: 'a.ts' })).toEqual({ type: 'ask', question: 'Why?', focus: 'a.ts' })
     expect(parseAction({ type: 'ask', id: 'q1', question: 'Why?', target: { path: 'a.ts', symbol: 'f', selection: 'x', lines: [3, 1] } })).toEqual({
@@ -110,7 +113,7 @@ describe('web bridge helpers', () => {
     expect(snapshot.diagram.status).toBe('idle')
     expect(snapshot.generatedAt).toBe('1970-01-01T00:00:00.000Z')
     expect(snapshot.protocol).toBe(WEB_PROTOCOL)
-    expect(WEB_PROTOCOL).toBe(4)
+    expect(WEB_PROTOCOL).toBe(5)
     expect(Object.keys(snapshot.files).length).toBe(parsed.plan.files.length)
     expect(Object.keys(snapshot.ok)).toEqual(['src/auth/user.ts'])
     expect(Object.keys(snapshot.explanations)).toEqual(['e1'])
