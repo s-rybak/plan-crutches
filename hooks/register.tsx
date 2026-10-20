@@ -1435,6 +1435,16 @@ async function deleteComment($: EngineInterface, id: string): Promise<void> {
   changed($)
 }
 
+/** A new text for a pending comment. A sent or resolved comment stays as Claude saw it. */
+async function editComment($: EngineInterface, id: string, text: string): Promise<void> {
+  const comments = await read($, commentsAtom)
+  const comment = comments.find(one => one.id === id)
+  if (!comment || comment.sentInVersion !== undefined || comment.resolvedInVersion !== undefined || comment.text === text) return
+  await update($, commentsAtom, list => list.map(one => (one.id === id ? { ...one, text } : one)))
+  await writeRecord($)
+  changed($)
+}
+
 // ---- the change diagram -----------------------------------------------------
 // A clean session draws it: a subagent of the mod's own type, read-only tools,
 // no history, the plan in its prompt. Its answer arrives as its turn.complete.
@@ -1649,6 +1659,8 @@ async function handleAction($: EngineInterface, action: WebAction): Promise<void
       return addComment($, action.target, action.text)
     case 'deleteComment':
       return deleteComment($, action.id)
+    case 'editComment':
+      return editComment($, action.id, action.text)
     case 'submit':
       return submit($)
     case 'loadFile':

@@ -49,6 +49,7 @@ const ui = {
   replyOpen: new Set(),
   highlight: stored('plan-crutches-highlight', '0') === '1',
   editingSummary: false,
+  editingComment: null,
 }
 
 let state = null
@@ -74,7 +75,7 @@ function freshId(taken = state ? state.qa.map(one => one.id) : []) {
 // The state shape and the actions this page expects; hooks/web.ts carries the
 // same number. A session keeps the mod it started with, while this file comes
 // from disk, so an older mod behind a newer page gets a warning.
-const PROTOCOL = 4
+const PROTOCOL = 5
 const staleMod = () => Boolean(state && state.plan && state.protocol !== PROTOCOL)
 
 // ---------- what the page shows: the current plan, or an earlier version ----------
@@ -210,17 +211,35 @@ function describeTarget(target) {
   return parts.join(' · ')
 }
 
+/**
+ * One comment card. A pending comment can be edited in place (the text turns
+ * into a textarea with Save and Cancel) or deleted; a sent or resolved one
+ * stays as Claude saw it.
+ */
 function renderComment(comment, { withOpen = false } = {}) {
   const kind = commentState(comment)
   const label = kind === 'pending' ? L('pending') : kind === 'sent' ? `${L('sent')} (v${comment.sentInVersion})` : `${L('resolved')} (v${comment.resolvedInVersion})`
   const open = withOpen && comment.target.path && !comment.target.path.endsWith('/') ? ` data-action="open-file" data-path="${escapeHtml(comment.target.path)}" style="cursor:pointer"` : ''
+  const id = escapeHtml(comment.id)
+  const editing = kind === 'pending' && ui.editingComment === comment.id
+  const text = editing
+    ? `<textarea class="comment-edit" data-draft="comment:${id}" data-comment-edit="${id}" rows="${Math.min(12, Math.max(2, comment.text.split('\n').length + 1))}">${escapeHtml(comment.text)}</textarea>` +
+      `<div class="edit-actions"><span class="hint"><kbd>Enter</kbd> ${L('save')} · <kbd>Esc</kbd> ${L('cancel')}</span><span class="spacer"></span>` +
+      `<button class="btn small" data-action="cancel-comment-edit">${L('cancel')}</button><button class="btn small primary" data-action="save-comment-edit" data-id="${id}">${L('save')}</button></div>`
+    : `<div class="text">${escapeHtml(comment.text)}</div>`
+  const tools =
+    kind === 'pending' && !editing
+      ? `<button class="tool" data-action="edit-comment" data-id="${id}" title="${L('editComment')}">✎</button>` +
+        `<button class="tool del" data-action="delete-comment" data-id="${id}" title="${L('delete')}">✕</button>`
+      : ''
   return (
-    `<div class="comment ${kind}">` +
+    `<div class="comment ${kind}${editing ? ' editing' : ''}">` +
     `<div class="body"><div class="where"${open}>${escapeHtml(describeTarget(comment.target))}</div>` +
     (comment.target.selection ? `<div class="quote">${escapeHtml(comment.target.selection.slice(0, 400))}</div>` : '') +
-    `<div class="text">${escapeHtml(comment.text)}</div></div>` +
+    text +
+    `</div>` +
     `<div class="state">${escapeHtml(label)}</div>` +
-    (kind === 'pending' ? `<button class="del" data-action="delete-comment" data-id="${comment.id}" title="${L('delete')}">✕</button>` : '') +
+    tools +
     `</div>`
   )
 }
@@ -264,7 +283,8 @@ function renderHeader() {
     action = `<button class="btn primary" data-action="submit">${pending ? L('submitWith', { n: pending }) : L('approve')}</button>`
   }
   const themeLabel = L(`theme_${ui.theme}`)
-  const record = review.recordPath ? `<span title="${escapeHtml(review.recordPath)}">${L('recorded')}: ${escapeHtml(review.recordPath.replace(`${state.cwd}/`, ''))}</span>` : ''
+  // The record path is long: it takes a line of its own under the badges, so the Submit button stays on the first line.
+  const record = review.recordPath ? `<div class="record" title="${escapeHtml(review.recordPath)}">${L('recorded')}: <span class="path">${escapeHtml(review.recordPath.replace(`${state.cwd}/`, ''))}</span></div>` : ''
   const okCount = plan && plan.files.length ? `<span class="badge ok${okCountOf(plan) === plan.files.length ? ' done' : ''}" title="${L('okTitle')}">${L('okCount', { n: okCountOf(plan), m: plan.files.length })}</span>` : ''
   return (
     `<header class="top">` +
@@ -276,7 +296,6 @@ function renderHeader() {
     (review.isDemo ? `<span class="badge">${L('demo')}</span>` : '') +
     (plan ? `<span>${state.comments.length} ${L('comments')}</span>` : '') +
     okCount +
-    record +
     `</div>` +
     `<span class="spacer"></span>` +
     `<div class="actions">` +
@@ -285,6 +304,7 @@ function renderHeader() {
     `<button class="btn ghost small" data-action="lang">${L('lang')}</button>` +
     action +
     `</div>` +
+    record +
     `</header>`
   )
 }
@@ -791,7 +811,10 @@ function onState(next) {
     ui.fullFile.clear()
     ui.fullText.clear()
     ui.editingSummary = false
+    ui.editingComment = null
   }
+  // A comment that was sent or deleted meanwhile is no longer edited.
+  if (ui.editingComment && !pendingComments().some(one => one.id === ui.editingComment)) ui.editingComment = null
   const plan = shownPlan()
   if (ui.selected && !(plan && plan.files.some(one => one.path === ui.selected))) ui.selected = null
   if (next.notice && next.notice.id !== lastNotice) {
@@ -811,7 +834,7 @@ function onState(next) {
 // the plan changes it.
 
 function openPopup({ title, target, selection, prefill, at, mode = 'comment' }) {
-  popupState = { title, target: target || {}, selection: selection || '', prefill: prefill || '', at, mode, qaId: null, pending: null, explainId: null }
+  popupState = { title, target: target || {}, selection: selection || '', prefill: prefill || '', at, moved: null, mode, qaId: null, pending: null, explainId: null }
   if (mode === 'explain') requestExplanation()
   renderPopup({ focus: true })
 }
@@ -928,7 +951,7 @@ function renderPopup({ focus = false, keepDraft = true } = {}) {
   }
   popup.className = `popup mode-${mode}`
   popup.innerHTML =
-    `<div class="ptitle"><span>${escapeHtml(title)}</span><span class="spacer"></span><button class="btn ghost small" data-popup="cancel">✕</button></div>` +
+    `<div class="ptitle" title="${escapeHtml(L('dragToMove'))}"><span>${escapeHtml(title)}</span><span class="spacer"></span><button class="btn ghost small" data-popup="cancel" title="${escapeHtml(L('close'))}">✕</button></div>` +
     (selection && !(mode === 'ask' && (item || pending)) ? `<div class="pquote">${escapeHtml(selection)}</div>` : '') +
     tabs +
     body
@@ -944,13 +967,26 @@ function renderPopup({ focus = false, keepDraft = true } = {}) {
   }
 }
 
+/**
+ * Puts the popup next to its anchor, or where the user dragged it. A moved
+ * popup keeps its place while its content changes, and is kept inside the
+ * window when the content grows or the window shrinks.
+ */
 function placePopup() {
-  const { at } = popupState
+  const { at, moved } = popupState
   const width = popup.offsetWidth
   const height = popup.offsetHeight
-  const left = Math.min(Math.max(12, at.x), window.innerWidth - width - 12)
-  let top = at.y + 10
-  if (top + height > window.innerHeight - 12) top = Math.max(12, Math.min(at.y - height - 10, window.innerHeight - height - 12))
+  let left
+  let top
+  if (moved) {
+    left = Math.min(Math.max(0, moved.left), Math.max(0, window.innerWidth - width))
+    top = Math.min(Math.max(0, moved.top), Math.max(0, window.innerHeight - height))
+    popupState.moved = { left, top }
+  } else {
+    left = Math.min(Math.max(12, at.x), window.innerWidth - width - 12)
+    top = at.y + 10
+    if (top + height > window.innerHeight - 12) top = Math.max(12, Math.min(at.y - height - 10, window.innerHeight - height - 12))
+  }
   popup.style.left = `${left}px`
   popup.style.top = `${top}px`
 }
@@ -1054,6 +1090,52 @@ popup.addEventListener('keydown', event => {
   }
 })
 
+// ---------- moving the popup ----------
+// The title bar drags the window. The pointer is captured, so the drag goes on
+// outside the popup, and the mouseup that ends it opens no new popup from a
+// selection that is still on the page.
+
+let popupDrag = null
+let popupDragEndedAt = 0
+
+popup.addEventListener('pointerdown', event => {
+  if (event.button !== 0 || !popupState) return
+  if (!event.target.closest('.ptitle') || event.target.closest('button')) return
+  event.preventDefault()
+  const rect = popup.getBoundingClientRect()
+  popupDrag = { pointerId: event.pointerId, dx: event.clientX - rect.left, dy: event.clientY - rect.top }
+  popup.classList.add('dragging')
+  try {
+    popup.setPointerCapture(event.pointerId)
+  } catch {
+    // a synthetic pointer takes no capture; the drag still follows the pointer while it stays over the popup
+  }
+})
+
+popup.addEventListener('pointermove', event => {
+  if (!popupDrag || event.pointerId !== popupDrag.pointerId || !popupState) return
+  popupState.moved = { left: event.clientX - popupDrag.dx, top: event.clientY - popupDrag.dy }
+  placePopup()
+})
+
+function endPopupDrag(event) {
+  if (!popupDrag || event.pointerId !== popupDrag.pointerId) return
+  popupDrag = null
+  popupDragEndedAt = Date.now()
+  popup.classList.remove('dragging')
+  try {
+    popup.releasePointerCapture(event.pointerId)
+  } catch {
+    // already released
+  }
+}
+
+popup.addEventListener('pointerup', endPopupDrag)
+popup.addEventListener('pointercancel', endPopupDrag)
+window.addEventListener('resize', () => {
+  if (popupState && !popup.hidden) placePopup()
+})
+
 function rectOf(element) {
   const rect = element.getBoundingClientRect()
   return { x: rect.left, y: rect.bottom }
@@ -1092,6 +1174,7 @@ function checkSelection() {
 
 document.addEventListener('mouseup', event => {
   if (event.button !== 0) return
+  if (popupDrag || Date.now() - popupDragEndedAt < 250) return
   if (event.target.closest('#popup') || event.target.closest('button, textarea, input, select, .diagram-card')) return
   setTimeout(checkSelection, 0)
 })
@@ -1156,6 +1239,18 @@ app.addEventListener('keydown', event => {
     }
     return
   }
+  if (event.target.dataset.commentEdit) {
+    // Like the popup's composer: Enter saves, Shift+Enter adds a line, Esc cancels.
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      ui.editingComment = null
+      render()
+    } else if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault()
+      saveCommentEdit(event.target.dataset.commentEdit)
+    }
+    return
+  }
   if (event.key !== 'Enter') return
   // Enter sends, Shift+Enter adds a line; Cmd/Ctrl+Enter sends too.
   if (event.shiftKey) return
@@ -1198,6 +1293,25 @@ function saveSummary() {
     if (staleMod()) return toast(L('staleMod'))
     run({ type: 'editSummary', text })
   }
+  render()
+}
+
+function focusEnd(area) {
+  if (!area) return
+  area.focus({ preventScroll: true })
+  area.setSelectionRange(area.value.length, area.value.length)
+}
+
+/** Saves the edited text of a pending comment; an empty or unchanged text only closes the editor. */
+function saveCommentEdit(id) {
+  const area = app.querySelector(`textarea[data-comment-edit="${id}"]`)
+  const comment = state && state.comments.find(one => one.id === id)
+  const text = area ? area.value.trim() : ''
+  if (area && comment && text && text !== comment.text) {
+    if (staleMod()) return toast(L('staleMod'))
+    run({ type: 'editComment', id, text })
+  }
+  ui.editingComment = null
   render()
 }
 
@@ -1341,6 +1455,18 @@ function handleAction(control) {
       break
     case 'delete-comment':
       run({ type: 'deleteComment', id: data.id })
+      break
+    case 'edit-comment':
+      ui.editingComment = data.id
+      render()
+      focusEnd(app.querySelector(`textarea[data-comment-edit="${data.id}"]`))
+      break
+    case 'cancel-comment-edit':
+      ui.editingComment = null
+      render()
+      break
+    case 'save-comment-edit':
+      saveCommentEdit(data.id)
       break
     case 'ask':
       submitQuestion()

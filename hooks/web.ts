@@ -24,6 +24,7 @@ import { deletedDiff, newFileStub, stubDiff } from './diff'
 export type WebAction =
   | { type: 'comment'; target: CommentTarget; text: string }
   | { type: 'deleteComment'; id: string }
+  | { type: 'editComment'; id: string; text: string }
   | { type: 'submit' }
   | { type: 'loadFile'; path: string }
   | { type: 'generateBody'; path: string; symbol: string }
@@ -101,6 +102,11 @@ export function parseAction(raw: unknown): WebAction | null {
     case 'deleteComment': {
       const id = str(raw.id, 64)
       return id ? { type: 'deleteComment', id } : null
+    }
+    case 'editComment': {
+      const id = str(raw.id, 64)
+      const text = str(raw.text)?.trim()
+      return id && text ? { type: 'editComment', id, text } : null
     }
     case 'submit':
       return { type: 'submit' }
