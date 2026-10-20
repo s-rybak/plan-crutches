@@ -221,3 +221,90 @@ export function renderDeletion(code, { path = '' } = {}) {
   const text = [`@@ -1,${gone.length} +0,0 @@`, ...gone.map(line => `-${line}`)].join('\n')
   return renderDiff(text, { path, headers: false })
 }
+
+/**
+ * The whole file with the diff's changes woven in: one unified diff whose
+ * only hunk covers every line, so the page shows the file as it is with the
+ * `-` and `+` lines of each change in their place. Each hunk of `diffText`
+ * is placed where its header says and checked against the file; a hunk
+ * whose old side does not match there is looked up by its old lines, and
+ * when it is nowhere in the file the result is null (the file changed since
+ * the diff was made, so the two cannot be shown as one).
+ */
+export function weaveDiff(fileText, diffText) {
+  const file = splitLines(fileText)
+  const hunks = parseHunks(diffText)
+  if (!hunks) return null
+  if (hunks.length === 0) return [`@@ -1,${file.length} +1,${file.length} @@`, ...file.map(line => ` ${line}`)].join('\n')
+  const placed = []
+  let cursor = 0
+  for (const hunk of hunks) {
+    let start = hunk.oldStart
+    if (!matchesAt(file, hunk.oldLines, start) || start < cursor) {
+      start = findOldLines(file, hunk.oldLines, cursor)
+      if (start < 0) return null
+    }
+    placed.push({ start, end: start + hunk.oldLines.length, lines: hunk.lines })
+    cursor = start + hunk.oldLines.length
+  }
+  const out = []
+  let at = 0
+  let added = 0
+  let removed = 0
+  for (const hunk of placed) {
+    for (; at < hunk.start; at += 1) out.push(` ${file[at]}`)
+    for (const line of hunk.lines) {
+      out.push(line)
+      if (line[0] === '+') added += 1
+      else if (line[0] === '-') removed += 1
+    }
+    at = hunk.end
+  }
+  for (; at < file.length; at += 1) out.push(` ${file[at]}`)
+  return [`@@ -1,${file.length} +1,${file.length - removed + added} @@`, ...out].join('\n')
+}
+
+/** The hunks of a unified diff: where each starts in the old file (0-based) and its lines; null when the text is no diff. */
+function parseHunks(diffText) {
+  const hunks = []
+  let current = null
+  for (const raw of splitLines(diffText)) {
+    const header = raw.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/)
+    if (header) {
+      const oldCount = header[2] === undefined ? 1 : Number(header[2])
+      // A hunk that only inserts says the line before the insertion; others say their first line, 1-based.
+      current = { oldStart: oldCount === 0 ? Number(header[1]) : Number(header[1]) - 1, lines: [], oldLines: [] }
+      hunks.push(current)
+      continue
+    }
+    if (raw.startsWith('---') || raw.startsWith('+++') || raw.startsWith('diff ') || raw.startsWith('index ')) continue
+    if (!current) {
+      if (raw.trim() === '') continue
+      return null
+    }
+    const sign = raw[0] === '+' || raw[0] === '-' || raw[0] === ' ' ? raw[0] : ' '
+    const line = sign === ' ' && raw[0] !== ' ' ? ` ${raw}` : raw
+    current.lines.push(line)
+    if (sign !== '+') current.oldLines.push(line.slice(1))
+  }
+  return hunks
+}
+
+function matchesAt(file, oldLines, start) {
+  if (start < 0 || start + oldLines.length > file.length) return false
+  for (let index = 0; index < oldLines.length; index += 1) if (file[start + index] !== oldLines[index]) return false
+  return true
+}
+
+/** The first place at or after `from` where the file holds `oldLines`; -1 when it is nowhere. */
+function findOldLines(file, oldLines, from) {
+  if (oldLines.length === 0) return -1
+  for (let start = from; start + oldLines.length <= file.length; start += 1) if (matchesAt(file, oldLines, start)) return start
+  return -1
+}
+
+/** A deleted file as one diff that removes every line, for the Full file view. */
+export function deletionOfFile(fileText) {
+  const gone = splitLines(fileText)
+  return [`@@ -1,${gone.length} +0,0 @@`, ...gone.map(line => `-${line}`)].join('\n')
+}

@@ -7,7 +7,7 @@ import { STRINGS, t } from '../web/i18n.js'
 import { escapeHtml, renderInline, renderMarkdown } from '../web/markdown.js'
 import { highlight, languageOf } from '../web/highlight.js'
 import { allDirKeys, buildTree, pathsUnder, renderTree } from '../web/tree.js'
-import { findStubRegions, renderDiff, renderSource } from '../web/codeview.js'
+import { deletionOfFile, findStubRegions, renderDiff, renderSource, weaveDiff } from '../web/codeview.js'
 
 test('i18n: both languages carry the same keys and params are filled in', () => {
   const en = Object.keys(STRINGS.en).sort()
@@ -313,4 +313,28 @@ test('codeview: a modified symbol shows its old lines before the stub, and the r
   const expanded = renderDiff(diff, { path: 'x.ts', inline: inlineReady })
   assert.ok(expanded.indexOf('class="line del"') < expanded.indexOf('class="inline-body"'), 'the old lines stay above the generated body')
   assert.equal((expanded.match(/class="line del"/g) || []).length, 3)
+})
+
+test('codeview: the Full file view weaves the hunks into the file, moves a shifted hunk and gives up on a changed file', () => {
+  const file = 'import x\nexport function f(): void {\n  return 1\n}\ntail\nmore\nend'
+  const diff = ['@@ -1,6 +1,5 @@', ' import x', '-export function f(): void {', '-  return 1', '-}', '+// New f.', '+export function f(): void {', '+  // implementation: expand in Plan Crutches', '+}', ' tail', ' more'].join('\n')
+  const woven = weaveDiff(file, diff)
+  assert.equal(woven, ['@@ -1,7 +1,8 @@', ' import x', '-export function f(): void {', '-  return 1', '-}', '+// New f.', '+export function f(): void {', '+  // implementation: expand in Plan Crutches', '+}', ' tail', ' more', ' end'].join('\n'))
+  const html = renderDiff(woven, { path: 'x.ts', headers: false })
+  assert.match(html, /class="line ctx" data-line="8" data-side="new"[^>]*><span class="ln old">7<\/span><span class="ln">8<\/span>/, 'every line of the file is there, numbered on both sides')
+  assert.doesNotMatch(html, /class="line hunk"/)
+  const symbol = { name: 'f', signature: 'export function f(): void {' }
+  const inline = { path: 'x.ts', symbols: [symbol], bodies: {}, expanded: new Set(), lang: 'en', commentedFor: () => new Set() }
+  assert.match(renderDiff(woven, { path: 'x.ts', headers: false, inline }), /data-action="inline-expand" data-path="x.ts" data-symbol="f"/, 'the stub keeps its Show implementation button')
+
+  const shifted = 'first\nsecond\n' + file
+  assert.equal(weaveDiff(shifted, diff), ['@@ -1,9 +1,10 @@', ' first', ' second', ' import x', '-export function f(): void {', '-  return 1', '-}', '+// New f.', '+export function f(): void {', '+  // implementation: expand in Plan Crutches', '+}', ' tail', ' more', ' end'].join('\n'))
+  assert.equal(weaveDiff('something\nelse', diff), null)
+  assert.equal(weaveDiff(file, ''), ['@@ -1,7 +1,7 @@', ...file.split('\n').map(line => ` ${line}`)].join('\n'))
+
+  const two = ['@@ -1,3 +1,4 @@', ' import x', '+// head', ' export function f(): void {', '   return 1', '@@ -5,3 +6,3 @@', ' tail', '-more', '+less', ' end'].join('\n')
+  assert.equal(weaveDiff(file, two), ['@@ -1,7 +1,8 @@', ' import x', '+// head', ' export function f(): void {', '   return 1', ' }', ' tail', '-more', '+less', ' end'].join('\n'))
+  const insertOnly = ['@@ -4,0 +5,2 @@', '+a', '+b'].join('\n')
+  assert.equal(weaveDiff(file, insertOnly), ['@@ -1,7 +1,9 @@', ' import x', ' export function f(): void {', '   return 1', ' }', '+a', '+b', ' tail', ' more', ' end'].join('\n'))
+  assert.equal(deletionOfFile('a\nb\n'), '@@ -1,2 +0,0 @@\n-a\n-b')
 })

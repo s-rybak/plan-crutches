@@ -3,7 +3,7 @@
 import { connect, act, projectUrl } from './api.js'
 import { t } from './i18n.js'
 import { renderMarkdown, escapeHtml } from './markdown.js'
-import { renderSource, renderDiff, renderReplaceDiff, renderDeletion, oldLinesBefore } from './codeview.js'
+import { renderSource, renderDiff, renderReplaceDiff, renderDeletion, oldLinesBefore, weaveDiff, deletionOfFile } from './codeview.js'
 import { buildTree, renderTree, allDirKeys, pathsUnder } from './tree.js'
 import { mountDiagram } from './diagram.js'
 import { fileDeltas, symbolDeltas, folderDelta } from './compare.js'
@@ -173,11 +173,21 @@ async function loadFullFile(path) {
   render()
 }
 
-function renderFullFile(path) {
-  const full = ui.fullText.get(path)
-  if (!full || full.status === 'loading') return `<div class="status hint"><span class="spinner"></span> ${L('loadingFile')}</div>`
-  if (full.status === 'failed') return `<div class="hint">${L('fileMissing')}</div>`
-  return block(renderSource(full.text, { path }), { path })
+/**
+ * The Full file view of a planned file: the whole file with the diff's
+ * changes woven in at their place, as one block. While the file loads, or
+ * when it is gone, the plain diff stays with a note; when the file no longer
+ * matches the diff, the diff stays and the file follows it as a listing.
+ */
+function renderFileChanges(file, entry, { commented, inline }) {
+  const diffHtml = entry.view ? block(renderDiff(entry.view.text, { path: file.path, commented, inline }), { path: file.path }) : ''
+  if (!ui.fullFile.has(file.path)) return diffHtml
+  const full = ui.fullText.get(file.path)
+  if (!full || full.status === 'loading') return diffHtml + `<div class="status hint"><span class="spinner"></span> ${L('loadingFile')}</div>`
+  if (full.status === 'failed') return diffHtml + `<div class="hint">${L('fileMissing')}</div>`
+  const woven = file.status === 'deleted' ? deletionOfFile(full.text) : entry.view ? weaveDiff(full.text, entry.view.text) : null
+  if (woven === null) return diffHtml + `<div class="hint">${L('fileChanged')}</div>` + block(renderSource(full.text, { path: file.path }), { path: file.path })
+  return block(renderDiff(woven, { path: file.path, commented, inline, headers: false }), { path: file.path })
 }
 
 function pendingComments() {
@@ -550,14 +560,13 @@ function renderFile(file) {
   } else if (entry.missing) {
     changes = `<div class="hint">${L('fileMissing')}</div>`
   } else {
-    const title = file.status === 'deleted' ? L('deletedFile') : L('diffTitle')
     const showFull = ui.fullFile.has(file.path)
+    const title = showFull ? L('fullFileTitle') : file.status === 'deleted' ? L('deletedFile') : L('diffTitle')
     changes =
       `<div class="section-title">${title}<span class="spacer"></span>` +
       `<button class="btn ghost small" data-action="full-file" data-path="${escapeHtml(file.path)}">${showFull ? L('hideFullFile') : L('fullFile')}</button>` +
       `</div>` +
-      (entry.view ? block(renderDiff(entry.view.text, { path: file.path, commented: linesCommented(file.path), inline: file.status === 'modified' ? inline : null }), { path: file.path }) : '') +
-      (showFull ? `<div class="section-title">${L('fullFile')}</div>` + renderFullFile(file.path) : '')
+      renderFileChanges(file, entry, { commented: linesCommented(file.path), inline: file.status === 'modified' ? inline : null })
   }
   const comments = readonly ? [] : state.comments.filter(one => one.target.path === file.path)
   const symbols = file.symbols.map(symbol =>
