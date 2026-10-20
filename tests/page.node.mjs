@@ -7,7 +7,7 @@ import { STRINGS, t } from '../web/i18n.js'
 import { escapeHtml, renderInline, renderMarkdown } from '../web/markdown.js'
 import { highlight, languageOf } from '../web/highlight.js'
 import { allDirKeys, buildTree, pathsUnder, renderTree } from '../web/tree.js'
-import { deletionOfFile, findStubRegions, renderDiff, renderSource, weaveDiff } from '../web/codeview.js'
+import { deletionOfFile, findStubRegions, foldRanges, renderDiff, renderSource, stubbedSymbols, weaveDiff } from '../web/codeview.js'
 
 test('i18n: both languages carry the same keys and params are filled in', () => {
   const en = Object.keys(STRINGS.en).sort()
@@ -337,4 +337,79 @@ test('codeview: the Full file view weaves the hunks into the file, moves a shift
   const insertOnly = ['@@ -4,0 +5,2 @@', '+a', '+b'].join('\n')
   assert.equal(weaveDiff(file, insertOnly), ['@@ -1,7 +1,9 @@', ' import x', ' export function f(): void {', '   return 1', ' }', '+a', '+b', ' tail', ' more', ' end'].join('\n'))
   assert.equal(deletionOfFile('a\nb\n'), '@@ -1,2 +0,0 @@\n-a\n-b')
+})
+
+test('codeview: foldRanges hides the unchanged stretches, keeps context around anchors and leaves short or opened stretches alone', () => {
+  const foldable = index => Array.from({ length: 20 }, (_, at) => !index.includes(at))
+  const anchor = index => Array.from({ length: 20 }, (_, at) => index.includes(at))
+  assert.deepEqual(foldRanges(foldable([10]), anchor([10]), { context: 2 }), [
+    { start: 0, end: 8 },
+    { start: 13, end: 20 },
+  ])
+  assert.deepEqual(foldRanges(foldable([10]), anchor([10]), { context: 2, unfolded: new Set([0]) }), [{ start: 13, end: 20 }])
+  assert.deepEqual(foldRanges(foldable([5, 11]), anchor([5, 11]), { context: 2 }), [
+    { start: 0, end: 3 },
+    { start: 14, end: 20 },
+  ], 'the five lines between two changes keep two of context on each side and the one left over stays open; two lines above the first change are too few to fold')
+  assert.deepEqual(foldRanges(foldable([4, 10]), anchor([4, 10]), { context: 2 }), [{ start: 13, end: 20 }], 'two lines above the first change are too few to fold')
+  assert.deepEqual(foldRanges(foldable([]), anchor([]), { context: 2 }), [{ start: 0, end: 20 }], 'a diff without a change folds whole')
+  const header = foldable([0, 10])
+  assert.deepEqual(foldRanges(header, anchor([10]), { context: 2 }), [
+    { start: 1, end: 8 },
+    { start: 13, end: 20 },
+  ], 'a line that neither hides nor anchors, such as a hunk header, only bounds a stretch')
+})
+
+test('codeview: the folded file view hides the unchanged stretches behind one row each, numbers the lines through them and opens a fold on demand', () => {
+  const file = Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join('\n')
+  const diff = ['@@ -13,5 +13,6 @@', ' line 13', ' line 14', '-line 15', '+line 15a', '+line 15b', ' line 16', ' line 17'].join('\n')
+  const woven = weaveDiff(file, diff)
+  const foldsIn = html =>
+    [...html.matchAll(/class="line fold" data-action="unfold" data-path="x.ts" data-fold="(\d+)" title="Click to show these lines"><span class="ln old"><\/span><span class="ln"><\/span><span class="sign"><\/span><span class="src">⋯ (\d+) unchanged lines<\/span><\/div>/g)].map(match => [Number(match[1]), Number(match[2])])
+  const folded = renderDiff(woven, { path: 'x.ts', headers: false, fold: { unfolded: new Set(), lang: 'en' } })
+  assert.deepEqual(foldsIn(folded), [
+    [1, 11],
+    [21, 12],
+  ], 'lines 1-11 and 19-30 hide; three lines of context stay on each side of the change')
+  assert.doesNotMatch(folded, /class="line ctx" data-line="1"/)
+  assert.match(folded, /class="line ctx" data-line="12" data-side="new"[^>]*><span class="ln old">12<\/span><span class="ln">12<\/span>/, 'the numbering continues through a fold')
+  assert.match(folded, /class="line del" data-line="15" data-side="old"/)
+  assert.match(folded, /class="line add" data-line="16" data-side="new"/)
+  assert.match(folded, /class="line ctx" data-line="19" data-side="new"[^>]*><span class="ln old">18<\/span><span class="ln">19<\/span>/, 'after the change the two sides differ by one')
+  assert.doesNotMatch(folded, /class="line hunk"/)
+
+  const opened = renderDiff(woven, { path: 'x.ts', headers: false, fold: { unfolded: new Set([1]), lang: 'en' } })
+  assert.deepEqual(foldsIn(opened), [[21, 12]])
+  assert.match(opened, /class="line ctx" data-line="1" data-side="new"/)
+
+  const commented = renderDiff(woven, { path: 'x.ts', headers: false, commented: new Set([5]), fold: { unfolded: new Set(), lang: 'en' } })
+  assert.deepEqual(foldsIn(commented), [
+    [9, 3],
+    [21, 12],
+  ], 'a commented line never hides and keeps its context; the stretch above it is too short to fold')
+  assert.match(commented, /class="line ctx commented" data-line="5" data-side="new"/)
+
+  assert.deepEqual(foldsIn(renderDiff(weaveDiff(file, ''), { path: 'x.ts', headers: false, fold: { unfolded: new Set(), lang: 'en' } })), [[1, 30]])
+  assert.match(renderDiff(woven, { path: 'x.ts', headers: false, fold: { unfolded: new Set(), lang: 'uk' } }), /⋯ рядків без змін: 11/)
+
+  const big = Array.from({ length: 3100 }, (_, index) => `l${index + 1}`).join('\n')
+  const tail = weaveDiff(big, ['@@ -3099,2 +3099,2 @@', ' l3099', '-l3100', '+l3100x'].join('\n'))
+  assert.match(renderDiff(tail, { path: 'x.ts', headers: false }), /more lines not shown/, 'the plain view is cut')
+  const bigFolded = renderDiff(tail, { path: 'x.ts', headers: false, fold: { unfolded: new Set(), lang: 'en' } })
+  assert.doesNotMatch(bigFolded, /more lines not shown/)
+  assert.match(bigFolded, /class="line add" data-line="3100"/, 'the folded view keeps a change past the cap')
+})
+
+test('codeview: a stub row names its symbol, and stubbedSymbols says which bodies have a place in the view', () => {
+  const symbol = { name: 'f', signature: 'export function f(): void {' }
+  const other = { name: 'g', signature: 'function g()' }
+  const diff = ['@@ -1,2 +1,4 @@', ' import x', '+export function f(): void {', '+  // implementation: expand in Plan Crutches', '+}', ' tail'].join('\n')
+  const inline = { path: 'x.ts', symbols: [symbol], bodies: {}, expanded: new Set(), lang: 'en', commentedFor: () => new Set() }
+  assert.match(renderDiff(diff, { path: 'x.ts', inline }), /class="line add" data-line="2" data-side="new" data-stub="f"><span class="ln old">/)
+  assert.equal((renderDiff(diff, { path: 'x.ts', inline }).match(/data-stub=/g) || []).length, 1)
+  assert.match(renderSource('export function f(): void {\n  // implementation: expand in Plan Crutches\n}', { path: 'x.ts', inline }), /class="line" data-line="1" data-stub="f">/)
+  assert.doesNotMatch(renderDiff(diff, { path: 'x.ts' }), /data-stub=/, 'without inline there is no stub to scroll to')
+  assert.deepEqual([...stubbedSymbols({ format: 'diff', text: diff }, [symbol, other])], ['f'])
+  assert.deepEqual([...stubbedSymbols({ format: 'source', text: 'function g()\n// implementation: expand in Plan Crutches', startLine: 1 }, [symbol, other])], ['g'])
+  assert.deepEqual([...stubbedSymbols(undefined, [symbol])], [])
 })

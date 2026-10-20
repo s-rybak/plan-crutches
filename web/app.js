@@ -3,7 +3,7 @@
 import { connect, act, projectUrl } from './api.js'
 import { t } from './i18n.js'
 import { renderMarkdown, escapeHtml } from './markdown.js'
-import { renderSource, renderDiff, renderReplaceDiff, renderDeletion, oldLinesBefore, weaveDiff, deletionOfFile } from './codeview.js'
+import { renderSource, renderDiff, renderReplaceDiff, renderDeletion, oldLinesBefore, weaveDiff, deletionOfFile, stubbedSymbols } from './codeview.js'
 import { buildTree, renderTree, allDirKeys, pathsUnder } from './tree.js'
 import { mountDiagram } from './diagram.js'
 import { fileDeltas, symbolDeltas, folderDelta } from './compare.js'
@@ -35,9 +35,13 @@ const ui = {
   tab: 'changes',
   selected: null,
   collapsed: new Set(),
+  // The symbols whose generated body is open, in the file view and on the card alike.
   expanded: new Set(),
-  inlineExpanded: new Set(),
-  fullFile: new Set(),
+  // Files shown with every line, no folds; and per file, the folds the user opened.
+  unfoldedAll: new Set(),
+  unfolded: new Map(),
+  // The place in the file view that Expand implementation scrolled to, flashed for a moment.
+  reveal: null,
   fullText: new Map(),
   requested: new Set(),
   showFullSummary: false,
@@ -160,7 +164,8 @@ async function run(action) {
 }
 
 // The full text of a file is not in the state: the page reads it from the
-// server's /project/ route the first time the Full file button is pressed.
+// server's /project/ route when a modified file opens, and when every line
+// of a deleted file is asked for.
 async function loadFullFile(path) {
   if (ui.fullText.has(path)) return
   ui.fullText.set(path, { status: 'loading' })
@@ -175,20 +180,33 @@ async function loadFullFile(path) {
 }
 
 /**
- * The Full file view of a planned file: the whole file with the diff's
- * changes woven in at their place, as one block. While the file loads, or
- * when it is gone, the plain diff stays with a note; when the file no longer
- * matches the diff, the diff stays and the file follows it as a listing.
+ * The code view of a modified or deleted file, with the `mode` it ended in.
+ * A modified file shows whole, the diff's changes woven in at their place:
+ * folded to the changed lines (`folded`) or with every line (`all`). Until
+ * its text arrives there is a spinner (`loading`); when the text cannot be
+ * read, or no longer matches the diff, the plain diff stays with a note
+ * (`diff`). A deleted file shows the first lines of its diff (`deleted`) or
+ * every line as removed (`deleted-all`).
  */
 function renderFileChanges(file, entry, { commented, inline }) {
-  const diffHtml = entry.view ? block(renderDiff(entry.view.text, { path: file.path, commented, inline }), { path: file.path }) : ''
-  if (!ui.fullFile.has(file.path)) return diffHtml
-  const full = ui.fullText.get(file.path)
-  if (!full || full.status === 'loading') return diffHtml + `<div class="status hint"><span class="spinner"></span> ${L('loadingFile')}</div>`
-  if (full.status === 'failed') return diffHtml + `<div class="hint">${L('fileMissing')}</div>`
-  const woven = file.status === 'deleted' ? deletionOfFile(full.text) : entry.view ? weaveDiff(full.text, entry.view.text) : null
-  if (woven === null) return diffHtml + `<div class="hint">${L('fileChanged')}</div>` + block(renderSource(full.text, { path: file.path }), { path: file.path })
-  return block(renderDiff(woven, { path: file.path, commented, inline, headers: false }), { path: file.path })
+  const path = file.path
+  const diffHtml = entry.view ? block(renderDiff(entry.view.text, { path, commented, inline }), { path }) : ''
+  const full = ui.fullText.get(path)
+  const allLines = ui.unfoldedAll.has(path)
+  const loading = `<div class="status hint"><span class="spinner"></span> ${L('loadingFile')}</div>`
+  const unreadable = `<div class="hint">${L('fileUnreadable')}</div>`
+  if (file.status === 'deleted') {
+    if (!allLines) return { mode: 'deleted', html: diffHtml }
+    if (!full || full.status === 'loading') return { mode: 'deleted-all', html: diffHtml + loading }
+    if (full.status === 'failed') return { mode: 'deleted-all', html: diffHtml + unreadable }
+    return { mode: 'deleted-all', html: block(renderDiff(deletionOfFile(full.text), { path, commented, headers: false }), { path }) }
+  }
+  if (!full || full.status === 'loading') return { mode: 'loading', html: loading }
+  if (full.status === 'failed') return { mode: 'diff', html: diffHtml + unreadable }
+  const woven = entry.view ? weaveDiff(full.text, entry.view.text) : null
+  if (woven === null) return { mode: 'diff', html: diffHtml + `<div class="hint">${L('fileChanged')}</div>` + block(renderSource(full.text, { path }), { path }) }
+  const fold = allLines ? null : { unfolded: ui.unfolded.get(path) || new Set(), lang }
+  return { mode: allLines ? 'all' : 'folded', html: block(renderDiff(woven, { path, commented, inline, headers: false, fold }), { path }) }
 }
 
 function pendingComments() {
@@ -482,7 +500,12 @@ function deltaChipHtml(delta) {
 }
 
 /**
- * One symbol card. `context.entry` is the file's view (its diff holds the
+ * One symbol card: the signature, the description and the Expand
+ * implementation button. `context.placed` names the symbols whose stub the
+ * file view holds: their generated body shows there, in the stub's place,
+ * and the card only says how the generation goes. A symbol with no place in
+ * the file view (the file is missing, or its stub was not found) shows the
+ * body on the card. `context.entry` is the file's view (its diff holds the
  * code a modified symbol has today), `context.delta` and `context.previous`
  * come from the compare view, `context.readonly` hides the actions when an
  * earlier version is shown.
@@ -493,13 +516,17 @@ function renderSymbol(file, symbol, context) {
   const change = symbol.change || 'new'
   const { readonly, entry } = context
   const isExpanded = !readonly && ui.expanded.has(key)
-  const oldLines = change === 'modified' && entry && entry.view && entry.view.format === 'diff' ? oldLinesBefore(entry.view.text, symbol) : []
+  const inFile = Boolean(context.placed && context.placed.has(symbol.name))
   let bodyHtml = ''
   if (isExpanded) {
     if (!body || body.status === 'loading') bodyHtml = `<div class="status"><span class="spinner"></span>${L('generating')}</div>`
     else if (body.status === 'failed') bodyHtml = `<div class="status error">${L('generationFailed')}: ${escapeHtml(body.error || '')}</div>`
-    else if (oldLines.length) bodyHtml = block(renderReplaceDiff(oldLines, body.code || '', { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
-    else bodyHtml = block(renderSource(body.code || '', { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
+    else if (!inFile) {
+      const oldLines = change === 'modified' && entry && entry.view && entry.view.format === 'diff' ? oldLinesBefore(entry.view.text, symbol) : []
+      bodyHtml = oldLines.length
+        ? block(renderReplaceDiff(oldLines, body.code || '', { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
+        : block(renderSource(body.code || '', { path: file.path, commented: linesCommented(file.path, symbol.name) }), { path: file.path, symbol: symbol.name })
+    }
   }
   const previous = context.previous
   const signatureChanged = context.delta === 'changed' && previous && previous.signature !== symbol.signature
@@ -513,13 +540,15 @@ function renderSymbol(file, symbol, context) {
   const note = change === 'deleted' ? `<div class="hint">${L('deletedSymbolNote')}</div>` : change === 'modified' ? `<div class="hint">${L('modifiedSymbolNote')}</div>` : ''
   let actions = ''
   if (!readonly) {
+    const where = `data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}"`
     if (change !== 'deleted') {
       actions += isExpanded
-        ? `<button class="btn small" data-action="collapse" data-key="${escapeHtml(key)}">${L('collapseImpl')}</button>` +
-          `<button class="btn small" data-action="regen" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">${L('regenerate')}</button>`
-        : `<button class="btn small" data-action="expand" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">${L('expandImpl')}</button>`
+        ? (inFile ? `<button class="btn small" data-action="show-in-file" ${where}>${L('showInFile')}</button>` : '') +
+          `<button class="btn small" data-action="collapse" ${where}>${L('collapseImpl')}</button>` +
+          `<button class="btn small" data-action="regen" ${where}>${L('regenerate')}</button>`
+        : `<button class="btn small" data-action="expand" ${where}>${L('expandImpl')}</button>`
     }
-    actions += `<button class="btn small" data-action="comment-symbol" data-path="${escapeHtml(file.path)}" data-symbol="${escapeHtml(symbol.name)}">💬</button>`
+    actions += `<button class="btn small" data-action="comment-symbol" ${where}>💬</button>`
   }
   return (
     `<div class="symbol change-${change}" data-symbol-card="${escapeHtml(symbol.name)}">` +
@@ -554,7 +583,7 @@ function inlineFor(file) {
     path: file.path,
     symbols: file.symbols,
     bodies: state.bodies,
-    expanded: ui.inlineExpanded,
+    expanded: ui.expanded,
     lang,
     commentedFor: symbol => linesCommented(file.path, symbol),
   }
@@ -580,19 +609,22 @@ function renderFile(file) {
   } else if (entry.missing) {
     changes = `<div class="hint">${L('fileMissing')}</div>`
   } else {
-    const showFull = ui.fullFile.has(file.path)
-    const title = showFull ? L('fullFileTitle') : file.status === 'deleted' ? L('deletedFile') : L('diffTitle')
-    changes =
-      `<div class="section-title">${title}<span class="spacer"></span>` +
-      `<button class="btn ghost small" data-action="full-file" data-path="${escapeHtml(file.path)}">${showFull ? L('hideFullFile') : L('fullFile')}</button>` +
-      `</div>` +
-      renderFileChanges(file, entry, { commented: linesCommented(file.path), inline: file.status === 'modified' ? inline : null })
+    const view = renderFileChanges(file, entry, { commented: linesCommented(file.path), inline: file.status === 'modified' ? inline : null })
+    const titles = { folded: 'foldedFileTitle', loading: 'foldedFileTitle', all: 'fullFileTitle', diff: 'diffTitle', deleted: 'deletedFile', 'deleted-all': 'deletedFile' }
+    // The diff of a deleted file is cut after its first lines; when it is whole, there is nothing more to show.
+    const cut = file.status === 'deleted' && entry.view && /\n-\.\.\. \d+ more lines$/.test(entry.view.text)
+    const toggles = { folded: 'showAllLines', all: 'foldUnchanged', deleted: cut ? 'showAllLines' : null, 'deleted-all': 'showLess' }
+    const toggle = toggles[view.mode] ? `<button class="btn ghost small" data-action="toggle-folds" data-path="${escapeHtml(file.path)}">${L(toggles[view.mode])}</button>` : ''
+    changes = `<div class="section-title" data-section="changes">${L(titles[view.mode])}<span class="spacer"></span>${toggle}</div>` + view.html
   }
+  // The symbols whose generated body has a place in the file view: the stub of each is there.
+  const placed = file.status !== 'deleted' && entry.loaded && !entry.missing ? stubbedSymbols(entry.view, file.symbols) : new Set()
   const comments = readonly ? [] : state.comments.filter(one => one.target.path === file.path)
   const symbols = file.symbols.map(symbol =>
     renderSymbol(file, symbol, {
       readonly,
       entry,
+      placed,
       delta: symbolDelta ? symbolDelta.byName.get(symbol.name) : null,
       previous: symbolDelta ? symbolDelta.previous.get(symbol.name) : null,
     }),
@@ -759,6 +791,7 @@ function render() {
   const panel = document.querySelector('.tree-panel')
   if (panel) panel.scrollTop = treeScroll
   measureTopbar()
+  flashReveal()
   requestFileIfNeeded()
 }
 
@@ -791,10 +824,49 @@ function requestFileIfNeeded() {
   const file = plan.files.find(one => one.path === ui.selected)
   if (!file || file.status === 'new') return
   const entry = shownFiles()[file.path]
+  // A modified file shows whole, so its text is read as soon as the file opens.
+  if (file.status === 'modified' && !(entry && entry.missing)) void loadFullFile(file.path)
   if (entry && entry.loaded) return
   if (ui.requested.has(file.path)) return
   ui.requested.add(file.path)
   run({ type: 'loadFile', path: file.path })
+}
+
+const REVEAL_MS = 1800
+
+/**
+ * Scrolls the file view to a symbol's generated body, or to its stub while
+ * the body is on its way, and flashes it. The page redraws when the body
+ * arrives, so the flash is kept in `ui.reveal` and drawn again after each
+ * redraw until its time is up: it ends on the body itself.
+ */
+function revealInFile(path, symbol) {
+  ui.reveal = { path, symbol, since: Date.now() }
+  const target = revealTarget()
+  if (!target) return
+  target.scrollIntoView({ block: 'center' })
+  flashReveal()
+}
+
+function revealTarget() {
+  const card = ui.reveal ? app.querySelector('.detail-card') : null
+  if (!card) return null
+  const name = CSS.escape(ui.reveal.symbol)
+  return card.querySelector(`.inline-body[data-path="${CSS.escape(ui.reveal.path)}"][data-symbol="${name}"]`) || card.querySelector(`[data-stub="${name}"]`)
+}
+
+/** Marks the revealed place; after a redraw the animation goes on from where it was. */
+function flashReveal() {
+  if (!ui.reveal) return
+  const elapsed = Date.now() - ui.reveal.since
+  if (elapsed >= REVEAL_MS) {
+    ui.reveal = null
+    return
+  }
+  const target = revealTarget()
+  if (!target) return
+  target.style.animationDelay = `-${elapsed}ms`
+  target.classList.add('flash')
 }
 
 function onState(next) {
@@ -807,8 +879,8 @@ function onState(next) {
     ui.planKey = planKey
     ui.requested.clear()
     ui.expanded.clear()
-    ui.inlineExpanded.clear()
-    ui.fullFile.clear()
+    ui.unfoldedAll.clear()
+    ui.unfolded.clear()
     ui.fullText.clear()
     ui.editingSummary = false
     ui.editingComment = null
@@ -1415,44 +1487,45 @@ function handleAction(control) {
     case 'comment-symbol':
       openPopup({ title: `${data.path} · ${data.symbol}`, target: { path: data.path, symbol: data.symbol }, at: rectOf(control) })
       break
-    case 'expand': {
+    // The card's Expand implementation and the file view's Show implementation
+    // open the same body, in the file view; the card's button also scrolls to it.
+    case 'expand':
+    case 'inline-expand': {
       const key = bodyKey(data.path, data.symbol)
       ui.expanded.add(key)
       const body = state.bodies[key]
       if (!body || body.status === 'failed') run({ type: 'generateBody', path: data.path, symbol: data.symbol })
       render()
+      if (action === 'expand') revealInFile(data.path, data.symbol)
       break
     }
     case 'collapse':
-      ui.expanded.delete(data.key)
-      render()
-      break
-    case 'inline-expand': {
-      const key = bodyKey(data.path, data.symbol)
-      ui.inlineExpanded.add(key)
-      const body = state.bodies[key]
-      if (!body || body.status === 'failed') run({ type: 'generateBody', path: data.path, symbol: data.symbol })
-      render()
-      break
-    }
     case 'inline-collapse':
-      ui.inlineExpanded.delete(bodyKey(data.path, data.symbol))
+      ui.expanded.delete(bodyKey(data.path, data.symbol))
       render()
       break
+    case 'show-in-file':
+      revealInFile(data.path, data.symbol)
+      break
+    case 'regen':
     case 'inline-regen':
       run({ type: 'generateBody', path: data.path, symbol: data.symbol })
       break
-    case 'regen':
-      run({ type: 'generateBody', path: data.path, symbol: data.symbol })
-      break
-    case 'full-file':
-      if (ui.fullFile.has(data.path)) ui.fullFile.delete(data.path)
+    case 'toggle-folds':
+      if (ui.unfoldedAll.has(data.path)) ui.unfoldedAll.delete(data.path)
       else {
-        ui.fullFile.add(data.path)
+        ui.unfoldedAll.add(data.path)
         void loadFullFile(data.path)
       }
       render()
       break
+    case 'unfold': {
+      const open = ui.unfolded.get(data.path) || new Set()
+      open.add(Number(data.fold))
+      ui.unfolded.set(data.path, open)
+      render()
+      break
+    }
     case 'delete-comment':
       run({ type: 'deleteComment', id: data.id })
       break

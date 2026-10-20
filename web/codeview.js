@@ -3,13 +3,18 @@
 // `inline`, a planned symbol's stub gets a Show implementation button and the
 // generated code takes the stub's place in the block: for a modified symbol
 // the lines of its current code stay above it as `-` lines, so the block
-// reads like a git diff.
+// reads like a git diff. With `fold`, the unchanged stretches of a diff hide
+// behind one row each, the way a code host folds a file down to its changes.
 import { escapeHtml } from './markdown.js'
 import { highlight } from './highlight.js'
 import { t } from './i18n.js'
 
 const MAX_LINES = 3000
 const PLACEHOLDER = 'implementation: expand in Plan Crutches'
+/** Unchanged lines kept on each side of a change when the rest is folded. */
+export const FOLD_CONTEXT = 3
+/** A stretch shorter than this stays open: a fold row would save nothing. */
+const MIN_FOLD = 3
 
 function cap(lines) {
   if (lines.length <= MAX_LINES) return { lines, note: '' }
@@ -133,21 +138,121 @@ export function renderSource(code, { path = '', startLine = 1, commented = new S
     const classes = ['line']
     if (commented.has(number)) classes.push('commented')
     rows.push(
-      `<div class="${classes.join(' ')}" data-line="${number}"><span class="ln">${number}</span><span class="src">${marked[index] ?? ''}</span>${region ? actionsFor(inline, region.symbol) : ''}</div>`,
+      `<div class="${classes.join(' ')}" data-line="${number}"${stubAttr(region)}><span class="ln">${number}</span><span class="src">${marked[index] ?? ''}</span>${region ? actionsFor(inline, region.symbol) : ''}</div>`,
     )
   }
   return `<div class="code source${commented.size ? ' marked' : ''}">${rows.join('')}${note ? `<div class="cap">${escapeHtml(note)}</div>` : ''}</div>`
 }
 
-export function renderDiff(diff, { path = '', commented = new Set(), inline = null, headers = true } = {}) {
-  const { lines, note } = cap(splitLines(diff))
+/** The row that carries a stub's first line names its symbol, so the page can scroll to it. */
+function stubAttr(region) {
+  return region ? ` data-stub="${escapeHtml(region.symbol.name)}"` : ''
+}
+
+/** The names of the symbols whose stub a file view holds: the generated body of each has a place in it. */
+export function stubbedSymbols(view, symbols) {
+  if (!view || typeof view.text !== 'string') return new Set()
+  const lines = splitLines(view.text)
+  const texts = view.format === 'diff' ? lines.map(raw => (raw[0] === '+' ? raw.slice(1) : null)) : lines
+  return new Set([...findStubRegions(texts, symbols).values()].map(region => region.symbol.name))
+}
+
+/**
+ * The stretches of a diff that a folded view hides, as [start, end) line
+ * indexes. `foldable[i]` says the line can hide (an unchanged line nobody
+ * commented on), `anchor[i]` says it must stay and keeps `context` lines on
+ * each side of it (a changed or commented line). A stretch that starts in
+ * `unfolded` stays open, and so does one shorter than `minHidden` lines.
+ */
+export function foldRanges(foldable, anchor, { context = FOLD_CONTEXT, minHidden = MIN_FOLD, unfolded = new Set() } = {}) {
+  const count = foldable.length
+  const anchorBefore = new Array(count + 1).fill(false)
+  for (let index = 0; index < count; index += 1) anchorBefore[index + 1] = anchorBefore[index] || Boolean(anchor[index])
+  const anchorAfter = new Array(count + 1).fill(false)
+  for (let index = count - 1; index >= 0; index -= 1) anchorAfter[index] = anchorAfter[index + 1] || Boolean(anchor[index])
+  const ranges = []
+  let index = 0
+  while (index < count) {
+    if (!foldable[index]) {
+      index += 1
+      continue
+    }
+    let end = index
+    while (end < count && foldable[end]) end += 1
+    const start = index + (anchorBefore[index] ? context : 0)
+    const stop = end - (anchorAfter[end] ? context : 0)
+    if (stop - start >= minHidden && !unfolded.has(start)) ranges.push({ start, end: stop })
+    index = end
+  }
+  return ranges
+}
+
+/** The folds of a diff's lines, keyed by their first hidden index; a commented unchanged line never hides. */
+function foldsOf(lines, commented, fold) {
+  const foldable = []
+  const anchor = []
+  let newLine = 0
+  for (const raw of lines) {
+    if (raw.startsWith('@@')) {
+      const match = raw.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+      if (match) newLine = Number(match[2])
+      foldable.push(false)
+      anchor.push(false)
+      continue
+    }
+    if (raw.startsWith('---') || raw.startsWith('+++') || raw.startsWith('diff ') || raw.startsWith('index ')) {
+      foldable.push(false)
+      anchor.push(false)
+      continue
+    }
+    if (raw[0] === '+') {
+      foldable.push(false)
+      anchor.push(true)
+      newLine += 1
+    } else if (raw[0] === '-') {
+      foldable.push(false)
+      anchor.push(true)
+    } else {
+      const kept = commented.has(newLine)
+      foldable.push(!kept)
+      anchor.push(kept)
+      newLine += 1
+    }
+  }
+  const folds = new Map()
+  for (const range of foldRanges(foldable, anchor, fold)) folds.set(range.start, range)
+  return folds
+}
+
+/**
+ * `fold` is `{ unfolded, lang, context? }`: the diff's unchanged stretches
+ * hide behind one row each, except those whose first index is in `unfolded`
+ * (the user opened them). A folded diff is never cut at MAX_LINES: its
+ * hidden lines cost no rows, and a cut could drop a change.
+ */
+export function renderDiff(diff, { path = '', commented = new Set(), inline = null, headers = true, fold = null } = {}) {
+  const { lines, note } = fold ? { lines: splitLines(diff), note: '' } : cap(splitLines(diff))
   const texts = lines.map(raw => (raw[0] === '+' ? raw.slice(1) : null))
   const regions = inline ? findStubRegions(texts, inline.symbols) : new Map()
+  const folds = fold ? foldsOf(lines, commented, fold) : new Map()
   let oldLine = 0
   let newLine = 0
   const rows = []
   for (let index = 0; index < lines.length; index += 1) {
     const raw = lines[index]
+    const hidden = folds.get(index)
+    if (hidden) {
+      // Only unchanged lines fold, so both sides of the numbering move on by the same count.
+      const count = hidden.end - hidden.start
+      rows.push(
+        `<div class="line fold" data-action="unfold" data-path="${escapeHtml(path)}" data-fold="${hidden.start}" title="${escapeHtml(t(fold.lang, 'unfoldHint'))}">` +
+          `<span class="ln old"></span><span class="ln"></span><span class="sign"></span><span class="src">${escapeHtml(t(fold.lang, 'foldedLines', { n: count }))}</span></div>`,
+      )
+      oldLine += count
+      newLine += count
+      index = hidden.end - 1
+      continue
+    }
     if (raw.startsWith('@@')) {
       const match = raw.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
       if (match) {
@@ -197,7 +302,7 @@ export function renderDiff(diff, { path = '', commented = new Set(), inline = nu
     const classes = ['line', kind]
     if (line && commented.has(line) && kind !== 'del') classes.push('commented')
     rows.push(
-      `<div class="${classes.join(' ')}" data-line="${line}" data-side="${kind === 'del' ? 'old' : 'new'}"><span class="ln old">${oldText}</span><span class="ln">${newText}</span><span class="sign">${sign === ' ' ? '' : sign}</span><span class="src">${highlight(body, path)}</span>${region ? actionsFor(inline, region.symbol) : ''}</div>`,
+      `<div class="${classes.join(' ')}" data-line="${line}" data-side="${kind === 'del' ? 'old' : 'new'}"${stubAttr(region)}><span class="ln old">${oldText}</span><span class="ln">${newText}</span><span class="sign">${sign === ' ' ? '' : sign}</span><span class="src">${highlight(body, path)}</span>${region ? actionsFor(inline, region.symbol) : ''}</div>`,
     )
   }
   return `<div class="code diff${commented.size ? ' marked' : ''}">${rows.join('')}${note ? `<div class="cap">${escapeHtml(note)}</div>` : ''}</div>`
